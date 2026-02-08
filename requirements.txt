@@ -1,2 +1,9 @@
-cryptography>=45.0.0
-pyzmq>=26.0.0
+cffi==2.0.0
+cryptography==46.0.4
+iniconfig==2.3.0
+packaging==26.0
+pluggy==1.6.0
+pycparser==3.0
+pygments==2.19.2
+pytest==9.0.2
+pyzmq==27.1.0
