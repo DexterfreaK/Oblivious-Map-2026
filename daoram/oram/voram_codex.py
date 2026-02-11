@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pickle
 import zlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -27,18 +28,20 @@ class TrueVoram(TreeBaseOram):
     def __init__(
             self,
             num_data: int,
-            data_size: int,
+            data_size: int, # Expected size of each stored value in bytes 
             client: InteractServer,
             name: str = "voram_true",
             filename: str = None,
             bucket_size: int = 1,
-            stash_scale: int = 7,
+            stash_scale: int = 7, # stash_scale*(level-1)*Z is the byte-based stash cap; original vORAM code had stash cap = 7*(level-1)*Z
             Z: Optional[int] = None,
             optimize: bool = True,
             keylen: int = 32,
             idlen: Optional[int] = None,
             compress: bool = True,
             encryptor: Encryptor = None,
+            suggested_params: bool = False,
+            suggested_nblobs: int = 4, # hardcoded as per original vORAM code number of blobs/chunks per node
             debug: bool = False,
     ):
         if bucket_size != 1:
@@ -57,6 +60,43 @@ class TrueVoram(TreeBaseOram):
             stash_scale=stash_scale,
             encryptor=encryptor,  # accepted for API consistency, not used for node crypto
         )
+
+        if suggested_nblobs <= 0:
+            raise ValueError("suggested_nblobs must be > 0.")
+
+        if suggested_params:
+            suggested = self.suggested_parameters(
+                num_data=self._num_data,
+                data_size=self._data_size,
+                keylen=keylen,
+                idlen=idlen,
+                nblobs=suggested_nblobs,
+            )
+            if idlen is None:
+                idlen = suggested["idlen"]
+            if Z is None:
+                Z = suggested["Z"]
+
+            total_buckets = (1 << self._level) - 1
+            suggested_msg = (
+                "\nCreating TrueVoram with:\n"
+                "    bucket size   {:.1f} KB\n"
+                "    # of levels   {}\n (assuming root level 0)"
+                "    total buckets {}\n"
+                "    total size    {:.1f} MB\n"
+                "    id length     {} bits\n"
+                "    key length    {} bits\n"
+                "    # of blobs    {}\n"
+            ).format(
+                Z / 2 ** 10,
+                self._level - 1,
+                total_buckets,
+                (Z * total_buckets) / 2 ** 20,
+                idlen * 8,
+                keylen * 8,
+                self._num_data,
+            )
+            logger.info("%s", suggested_msg)
 
         if Z is None:
             if optimize:
@@ -101,6 +141,7 @@ class TrueVoram(TreeBaseOram):
             self._keylen,
             self._compress,
         )
+        
 
     # --------------------------- Public API ---------------------------------
 
@@ -235,6 +276,62 @@ class TrueVoram(TreeBaseOram):
         """Smallest id length such that key+1 is always representable."""
         return max(1, (int(num_data).bit_length() + 7) // 8)
 
+    @staticmethod
+    def _clog(x: int, b: int = 2) -> int:
+        """Return ceil(log_b(x)), never below 1."""
+        if x < b:
+            return 1
+        return int(math.ceil(math.log(x, b)))
+
+    @classmethod
+    def _estimate_idlen(cls, num_data: int) -> int:
+        """Estimate id length following upstream vORAM collision heuristic."""
+        n = int(num_data)
+        return int(math.ceil((39 + cls._clog(n * max(n - 1, 1))) / 8))
+
+    @staticmethod
+    def _estimate_nodesize(blob_size: int, nblobs: int, idlen: int, keylen: int) -> int:
+        """Estimate node size following upstream vORAM heuristic."""
+        nolen = 2 * keylen + nblobs * (idlen + blob_size)
+        width = max(2 * nolen - 2 * keylen - 2, 2)
+        return int(nolen + nblobs * math.ceil(math.log(width, 8)))
+
+    @classmethod
+    def suggested_parameters(
+            cls,
+            num_data: int,
+            data_size: int,
+            keylen: int = 32,
+            idlen: Optional[int] = None,
+            nblobs: int = 4,
+    ) -> Dict[str, int]:
+        """
+        Return suggested vORAM parameters (`idlen`, `keylen`, `Z`).
+
+        Notes:
+        - This mirrors upstream vORAM's node-size/id-size style heuristics.
+        - Tree level is still determined by TreeBaseOram from `num_data`.
+        """
+        if nblobs <= 0:
+            raise ValueError("nblobs must be > 0.")
+        if idlen is None:
+            idlen = cls._estimate_idlen(num_data=num_data)
+
+        nodesize = cls._estimate_nodesize(
+            blob_size=data_size,
+            nblobs=nblobs,
+            idlen=idlen,
+            keylen=keylen,
+        )
+        if nodesize % cls._AES_BLOCK_SIZE:
+            nodesize += cls._AES_BLOCK_SIZE - (nodesize % cls._AES_BLOCK_SIZE)
+
+        return {
+            "idlen": int(idlen),
+            "keylen": int(keylen),
+            "Z": int(nodesize),
+        }
+
     def _compute_lenlen(self) -> int:
         """Compute byte-length used for chunk length fields."""
         # Must be able to encode any possible chunk length in one node.
@@ -255,9 +352,13 @@ class TrueVoram(TreeBaseOram):
     def _stash_bytes(self) -> int:
         return sum(len(value) for value in self._stash.values())
 
+       
+    # key=0   → 0x0001
+    # key=255 → 0x0100 (if idlen=2)
+    # This way, 0x0000 = "empty slot"
     def _encode_ident(self, key: int) -> bytes:
         return (key + 1).to_bytes(self._idlen, byteorder="big", signed=False)
-
+ 
     def _decode_ident(self, encoded: bytes) -> int:
         key = int.from_bytes(encoded, byteorder="big", signed=False) - 1
         if key < 0:

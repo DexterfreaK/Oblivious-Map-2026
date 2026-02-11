@@ -11,8 +11,16 @@ Examples:
 import argparse
 import time
 
+
+import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+    
 from daoram.dependency import InteractRemoteServer, ZMQSocket
-from daoram.oram import DAOram, FreecursiveOram, PathOram, RecursivePathOram
+from daoram.oram import DAOram, FreecursiveOram, PathOram, RecursivePathOram, TrueVoram
 
 # Available ORAM types.
 ORAM_TYPES = {
@@ -20,6 +28,7 @@ ORAM_TYPES = {
     "recursive": RecursivePathOram,
     "freecursive": FreecursiveOram,
     "da": DAOram,
+    "voram": TrueVoram,
 }
 
 
