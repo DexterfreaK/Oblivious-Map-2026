@@ -11,7 +11,17 @@ Examples:
 import argparse
 import time
 
-from daoram.dependency import InteractRemoteServer, ZMQSocket
+import argparse
+
+import os
+import sys
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+
+from daoram.dependency import InteractRemoteServer, ZMQSocket 
 from daoram.omap import AVLOmap, BPlusOmap, OramOstOmap
 from daoram.oram import DAOram
 
