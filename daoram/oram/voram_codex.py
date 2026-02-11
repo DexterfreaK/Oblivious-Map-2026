@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import pickle
 import zlib
@@ -11,6 +12,11 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from daoram.dependency import BinaryTree, Encryptor, InteractServer, PathData, UNSET
 from daoram.oram.tree_base_oram import TreeBaseOram
+
+logger = logging.getLogger(__name__)
+
+# Global debug gate for this module. Set to True for verbose internal tracing.
+DEBUG = pickle.TRUE
 
 
 class TrueVoram(TreeBaseOram):
@@ -33,6 +39,7 @@ class TrueVoram(TreeBaseOram):
             idlen: Optional[int] = None,
             compress: bool = True,
             encryptor: Encryptor = None,
+            debug: bool = False,
     ):
         if bucket_size != 1:
             raise ValueError("TrueVoram requires bucket_size to be exactly 1.")
@@ -81,14 +88,25 @@ class TrueVoram(TreeBaseOram):
         self._iv: Optional[bytes] = None
         self._tmp_leaf: Optional[int] = None
         self._initialized: bool = False
+        self._debug_enabled: bool = bool(DEBUG or debug)
 
         # Initialize a position map right away; init_server_storage resets it.
         self._init_pos_map()
+        self._debug(
+            "Initialized TrueVoram config: num_data=%d level=%d Z=%d idlen=%d keylen=%d compress=%s",
+            self._num_data,
+            self._level,
+            self._Z,
+            self._idlen,
+            self._keylen,
+            self._compress,
+        )
 
     # --------------------------- Public API ---------------------------------
 
     def init_server_storage(self, data_map: dict = None) -> None:
         """Initialize server storage and preload all keys."""
+        self._debug("init_server_storage start: data_map_provided=%s", data_map is not None)
         self._init_pos_map()
         self._tmp_leaf = None
         self._stash = {}
@@ -115,6 +133,7 @@ class TrueVoram(TreeBaseOram):
                     raise KeyError(f"Key {key} missing from data_map during initialization.")
                 value = data_map[key]
             self._stash[key] = bytearray(self._encode_value(value))
+        self._debug("Stash preloaded with %d keys (%d bytes).", len(self._stash), self._stash_bytes())
 
         # Bottom-up packing so lower nodes are filled first.
         for idx in reversed(range(self._tree.size)):
@@ -125,6 +144,11 @@ class TrueVoram(TreeBaseOram):
         self._enforce_stash_cap()
         self._initialized = True
         self.client.init_storage({self._name: self._tree})
+        self._debug(
+            "init_server_storage done: tree_size=%d stash_remaining=%d bytes",
+            self._tree.size,
+            self._stash_bytes(),
+        )
 
     def operate_on_key(self, key: int, value: Any = UNSET) -> Any:
         """Read/write one key and immediately evict the accessed path."""
@@ -135,15 +159,24 @@ class TrueVoram(TreeBaseOram):
         old_leaf = self._look_up_pos_map(key=key)
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
+        self._debug(
+            "operate_on_key: key=%d old_leaf=%d new_leaf=%d write=%s",
+            key,
+            old_leaf,
+            new_leaf,
+            value is not UNSET,
+        )
 
         self._read_path_into_stash(leaf=old_leaf)
 
         old_value = self._decode_key_from_stash(key=key)
         if value is not UNSET:
             self._stash[key] = bytearray(self._encode_value(value))
+            self._debug("operate_on_key: key=%d updated payload bytes=%d", key, len(self._stash[key]))
 
         self._enforce_stash_cap()
         self._write_path_from_stash(leaf=old_leaf, execute=True)
+        self._debug("operate_on_key complete: key=%d stash=%d bytes", key, self._stash_bytes())
         return old_value
 
     def operate_on_key_without_eviction(self, key: int, value: Any = UNSET) -> Any:
@@ -155,15 +188,24 @@ class TrueVoram(TreeBaseOram):
         old_leaf = self._look_up_pos_map(key=key)
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
+        self._debug(
+            "operate_on_key_without_eviction: key=%d old_leaf=%d new_leaf=%d write=%s",
+            key,
+            old_leaf,
+            new_leaf,
+            value is not UNSET,
+        )
 
         self._read_path_into_stash(leaf=old_leaf)
 
         old_value = self._decode_key_from_stash(key=key)
         if value is not UNSET:
             self._stash[key] = bytearray(self._encode_value(value))
+            self._debug("deferred update staged: key=%d payload bytes=%d", key, len(self._stash[key]))
 
         self._enforce_stash_cap()
         self._tmp_leaf = old_leaf
+        self._debug("deferred access pending on leaf=%d", self._tmp_leaf)
         return old_value
 
     def eviction_with_update_stash(self, key: int, value: Any, execute: bool = True) -> None:
@@ -175,9 +217,16 @@ class TrueVoram(TreeBaseOram):
             raise KeyError(f"Key {key} not found in stash.")
 
         self._stash[key] = bytearray(self._encode_value(value))
+        self._debug(
+            "eviction_with_update_stash: key=%d payload bytes=%d execute=%s",
+            key,
+            len(self._stash[key]),
+            execute,
+        )
         self._enforce_stash_cap()
         self._write_path_from_stash(leaf=self._tmp_leaf, execute=execute)
         self._tmp_leaf = None
+        self._debug("eviction_with_update_stash complete")
 
     # --------------------------- Internal helpers ---------------------------
 
@@ -197,6 +246,14 @@ class TrueVoram(TreeBaseOram):
     def _ensure_ready(self) -> None:
         if not self._initialized or self._tree is None or self._root_key is None or self._iv is None:
             raise ValueError("Storage not initialized. Call init_server_storage() first.")
+
+    def _debug(self, msg: str, *args: Any) -> None:
+        """Emit debug logs only when DEBUG mode is enabled."""
+        if self._debug_enabled:
+            logger.debug("[TrueVoram] " + msg, *args)
+
+    def _stash_bytes(self) -> int:
+        return sum(len(value) for value in self._stash.values())
 
     def _encode_ident(self, key: int) -> bytes:
         return (key + 1).to_bytes(self._idlen, byteorder="big", signed=False)
@@ -242,6 +299,7 @@ class TrueVoram(TreeBaseOram):
 
     def _read_path_into_stash(self, leaf: int) -> None:
         """Read one path, decrypt root->leaf, and append chunks to stash."""
+        self._debug("read_path start: leaf=%d", leaf)
         self.client.add_read_path(label=self._name, leaves=[leaf])
         result = self.client.execute()
         if not result.success:
@@ -258,6 +316,7 @@ class TrueVoram(TreeBaseOram):
             ciphertext = bucket[0]
             plaintext = self._aes_decrypt(key=self._node_keys[idx], ciphertext=ciphertext)
             self._parse_node_plaintext(idx=idx, plaintext=plaintext)
+        self._debug("read_path done: leaf=%d stash=%d bytes", leaf, self._stash_bytes())
 
     def _parse_node_plaintext(self, idx: int, plaintext: bytes) -> None:
         """Parse node plaintext: load child keys and append chunk records to stash."""
@@ -279,6 +338,8 @@ class TrueVoram(TreeBaseOram):
             self._node_keys[right_idx] = right_key
 
         # Chunk records.
+        parsed_chunks = 0
+        parsed_bytes = 0
         while offset + self._chunk_header <= self._Z:
             ident = plaintext[offset: offset + self._idlen]
             offset += self._idlen
@@ -299,6 +360,15 @@ class TrueVoram(TreeBaseOram):
 
             key = self._decode_ident(encoded=ident)
             self._stash.setdefault(key, bytearray()).extend(chunk)
+            parsed_chunks += 1
+            parsed_bytes += chunk_len
+        self._debug(
+            "parsed node idx=%d chunks=%d bytes=%d stash=%d bytes",
+            idx,
+            parsed_chunks,
+            parsed_bytes,
+            self._stash_bytes(),
+        )
 
     def _pack_node_plaintext(self, idx: int) -> bytes:
         """Build one node plaintext from child keys + eligible stash chunks."""
@@ -327,6 +397,8 @@ class TrueVoram(TreeBaseOram):
         offset += self._keylen
 
         # Write variable chunks greedily.
+        written_chunks = 0
+        written_bytes = 0
         for key in sorted(list(self._stash.keys())):
             if offset + self._chunk_header > self._Z:
                 break
@@ -351,11 +423,20 @@ class TrueVoram(TreeBaseOram):
             offset += self._lenlen
             buffer[offset: offset + chunk_len] = data[-chunk_len:]
             offset += chunk_len
+            written_chunks += 1
+            written_bytes += chunk_len
 
             del data[-chunk_len:]
             if not data:
                 del self._stash[key]
 
+        self._debug(
+            "packed node idx=%d chunks=%d bytes=%d stash=%d bytes",
+            idx,
+            written_chunks,
+            written_bytes,
+            self._stash_bytes(),
+        )
         return bytes(buffer)
 
     def _decode_key_from_stash(self, key: int) -> Any:
@@ -369,6 +450,7 @@ class TrueVoram(TreeBaseOram):
 
     def _write_path_from_stash(self, leaf: int, execute: bool) -> None:
         """Evict stash to one accessed path (leaf->root), rotate keys, and write."""
+        self._debug("write_path start: leaf=%d execute=%s", leaf, execute)
         out_path: PathData = {}
         for idx in self._tree.get_leaf_path(leaf):
             # Re-key node on every write, as in parent-held-key vORAM.
@@ -386,9 +468,11 @@ class TrueVoram(TreeBaseOram):
             result = self.client.execute()
             if not result.success:
                 raise RuntimeError(result.error or "Failed to write path to server.")
+        self._debug("write_path done: leaf=%d nodes=%d stash=%d bytes", leaf, len(out_path), self._stash_bytes())
 
     def _enforce_stash_cap(self) -> None:
-        stash_bytes = sum(len(value) for value in self._stash.values())
+        stash_bytes = self._stash_bytes()
+        self._debug("stash cap check: bytes=%d cap=%d", stash_bytes, self._stash_byte_cap)
         if stash_bytes > self._stash_byte_cap:
             raise MemoryError(
                 f"Stash overflow: {stash_bytes} bytes > {self._stash_byte_cap} bytes."
