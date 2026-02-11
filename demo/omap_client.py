@@ -22,11 +22,12 @@ if ROOT_DIR not in sys.path:
 
 
 from daoram.dependency import InteractRemoteServer, ZMQSocket 
+from daoram.dependency.crypto import AesGcm
 from daoram.omap import AVLOmap, BPlusOmap, OramOstOmap
-from daoram.oram import DAOram
+from daoram.oram import DAOram, TrueVoram
 
 # Available OMAP types.
-OMAP_TYPES = ["avl", "bplus", "daoram-avl", "daoram-bplus"]
+OMAP_TYPES = ["avl", "bplus", "daoram-avl", "daoram-bplus", "voram-avl"]
 
 
 def create_omap(omap_type: str, num_data: int, client: InteractRemoteServer):
@@ -41,7 +42,7 @@ def create_omap(omap_type: str, num_data: int, client: InteractRemoteServer):
         return OramOstOmap(num_data=num_data, ost=ods, oram=oram)
     elif omap_type == "daoram-bplus":
         ods = BPlusOmap(order=10, num_data=num_data, key_size=10, data_size=10, client=client)
-        oram = DAOram(num_data=num_data, data_size=10, client=client)
+        oram = DAOram(num_data=num_data, data_size=10, client=client, encryptor=AesGcm())
         return OramOstOmap(num_data=num_data, ost=ods, oram=oram)
 
 
@@ -66,10 +67,13 @@ def run_demo(omap_type: str, num_data: int, ip: str, port: int):
     start = time.time()
     errors = sum(1 for i in range(num_data) if omap.search(key=i) != i)
     search_time = time.time() - start
+    bw_r,bw_w = client.get_bandwidth()
 
     # Summary.
     print(f"Insert: {insert_time:.2f}s ({num_data/insert_time:.0f} ops/s)")
     print(f"Search: {search_time:.2f}s ({num_data/search_time:.0f} ops/s)")
+    print(f"Bandwidth - Read: {bw_r/2**20:.2f} MB/s, Write: {bw_w/2**20:.2f} MB/s")
+
     print(f"Errors: {errors}")
 
     client.close_connection()

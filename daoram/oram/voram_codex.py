@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from daoram.dependency import BinaryTree, Encryptor, InteractServer, PathData, UNSET
 from daoram.oram.tree_base_oram import TreeBaseOram
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Global debug gate for this module. Set to True for verbose internal tracing.
@@ -33,7 +33,7 @@ class TrueVoram(TreeBaseOram):
             name: str = "voram_true",
             filename: str = None,
             bucket_size: int = 1,
-            stash_scale: int = 7, # stash_scale*(level-1)*Z is the byte-based stash cap; original vORAM code had stash cap = 7*(level-1)*Z
+            stash_scale: int = 1, # stash_scale*(level-1)*Z is the byte-based stash cap; original vORAM code had stash cap = 7*(level-1)*Z
             Z: Optional[int] = None,
             optimize: bool = True,
             keylen: int = 32,
