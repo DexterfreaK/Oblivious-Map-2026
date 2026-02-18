@@ -1,5 +1,6 @@
 from .avl_omap import AVLOmap
 from .avl_omap_cache import AVLOmapCached
+from .avl_omap_voram import AVLOmapVoram
 from .bplus_omap import BPlusOmap
 from .bplus_omap_cache import BPlusOmapCached
 from .group_omap import GroupOmap

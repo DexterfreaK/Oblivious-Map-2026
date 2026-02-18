@@ -42,6 +42,7 @@ class TrueVoram(TreeBaseOram):
             encryptor: Encryptor = None,
             suggested_params: bool = False,
             suggested_nblobs: int = 4, # hardcoded as per original vORAM code number of blobs/chunks per node
+            allow_dynamic_keys: bool = False,
             debug: bool = False,
     ):
         if bucket_size != 1:
@@ -110,6 +111,7 @@ class TrueVoram(TreeBaseOram):
         self._keylen: int = keylen
         self._idlen: int = idlen if idlen is not None else self._default_idlen(num_data=self._num_data)
         self._compress: bool = bool(compress)
+        self._allow_dynamic_keys: bool = bool(allow_dynamic_keys)
         self._node_data_bytes: int = self._Z - 2 * self._keylen
         self._lenlen: int = self._compute_lenlen()
         self._chunk_header: int = self._idlen + self._lenlen
@@ -133,22 +135,43 @@ class TrueVoram(TreeBaseOram):
         # Initialize a position map right away; init_server_storage resets it.
         self._init_pos_map()
         self._debug(
-            "Initialized TrueVoram config: num_data=%d level=%d Z=%d idlen=%d keylen=%d compress=%s",
+            "Initialized TrueVoram config: num_data=%d level=%d Z=%d idlen=%d keylen=%d compress=%s dynamic=%s",
             self._num_data,
             self._level,
             self._Z,
             self._idlen,
             self._keylen,
             self._compress,
+            self._allow_dynamic_keys,
         )
         
 
     # --------------------------- Public API ---------------------------------
 
-    def init_server_storage(self, data_map: dict = None) -> None:
+    def init_server_storage(self, data_map: dict = None, pos_map: dict = None) -> None:
         """Initialize server storage and preload all keys."""
-        self._debug("init_server_storage start: data_map_provided=%s", data_map is not None)
-        self._init_pos_map()
+        self._debug(
+            "init_server_storage start: data_map_provided=%s pos_map_provided=%s",
+            data_map is not None,
+            pos_map is not None,
+        )
+
+        if pos_map is not None:
+            self._pos_map = {}
+            for key, leaf in pos_map.items():
+                key = self._validate_oram_key(key=key)
+                if not isinstance(leaf, int) or leaf < 0 or leaf >= self._leaf_range:
+                    raise ValueError(f"Leaf {leaf} for key {key} is out of range [0, {self._leaf_range}).")
+                self._pos_map[key] = leaf
+        elif self._allow_dynamic_keys:
+            self._pos_map = {}
+            if data_map:
+                for key in data_map.keys():
+                    key = self._validate_oram_key(key=key)
+                    self._pos_map[key] = self._get_new_leaf()
+        else:
+            self._init_pos_map()
+
         self._tmp_leaf = None
         self._stash = {}
         self._tree = BinaryTree(
@@ -165,15 +188,27 @@ class TrueVoram(TreeBaseOram):
         self._node_keys = {idx: os.urandom(self._keylen) for idx in range(self._tree.size)}
         self._node_keys[0] = self._root_key
 
-        # Pre-populate all keys, following TreeBase semantics.
-        for key in range(self._num_data):
-            if data_map is None:
-                value = os.urandom(self._data_size)
-            else:
-                if key not in data_map:
-                    raise KeyError(f"Key {key} missing from data_map during initialization.")
-                value = data_map[key]
-            self._stash[key] = bytearray(self._encode_value(value))
+        if self._allow_dynamic_keys:
+            if data_map:
+                for key in data_map.keys():
+                    key = self._validate_oram_key(key=key)
+                    if key not in self._pos_map:
+                        self._pos_map[key] = self._get_new_leaf()
+
+            keys_to_init = list(self._pos_map.keys())
+            for key in keys_to_init:
+                value = data_map[key] if (data_map is not None and key in data_map) else os.urandom(self._data_size)
+                self._stash[key] = bytearray(self._encode_value(value))
+        else:
+            # Pre-populate all keys, following TreeBase semantics.
+            for key in range(self._num_data):
+                if data_map is None:
+                    value = os.urandom(self._data_size)
+                else:
+                    if key not in data_map:
+                        raise KeyError(f"Key {key} missing from data_map during initialization.")
+                    value = data_map[key]
+                self._stash[key] = bytearray(self._encode_value(value))
         self._debug("Stash preloaded with %d keys (%d bytes).", len(self._stash), self._stash_bytes())
 
         # Bottom-up packing so lower nodes are filled first.
@@ -197,7 +232,15 @@ class TrueVoram(TreeBaseOram):
         if self._tmp_leaf is not None:
             raise ValueError("A deferred access is pending; call eviction_with_update_stash first.")
 
-        old_leaf = self._look_up_pos_map(key=key)
+        key = self._validate_oram_key(key=key)
+        is_write = value is not UNSET
+        if key in self._pos_map:
+            old_leaf = self._pos_map[key]
+        elif self._allow_dynamic_keys and is_write:
+            old_leaf = self._get_new_leaf()
+        else:
+            raise KeyError(f"Key {key} not found in position map.")
+
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
         self._debug(
@@ -210,8 +253,14 @@ class TrueVoram(TreeBaseOram):
 
         self._read_path_into_stash(leaf=old_leaf)
 
-        old_value = self._decode_key_from_stash(key=key)
-        if value is not UNSET:
+        if key in self._stash:
+            old_value = self._decode_key_from_stash(key=key)
+        elif self._allow_dynamic_keys and is_write:
+            old_value = None
+        else:
+            raise KeyError(f"Key {key} not found in stash.")
+
+        if is_write:
             self._stash[key] = bytearray(self._encode_value(value))
             self._debug("operate_on_key: key=%d updated payload bytes=%d", key, len(self._stash[key]))
 
@@ -226,7 +275,15 @@ class TrueVoram(TreeBaseOram):
         if self._tmp_leaf is not None:
             raise ValueError("A deferred access is already pending.")
 
-        old_leaf = self._look_up_pos_map(key=key)
+        key = self._validate_oram_key(key=key)
+        is_write = value is not UNSET
+        if key in self._pos_map:
+            old_leaf = self._pos_map[key]
+        elif self._allow_dynamic_keys and is_write:
+            old_leaf = self._get_new_leaf()
+        else:
+            raise KeyError(f"Key {key} not found in position map.")
+
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
         self._debug(
@@ -239,8 +296,14 @@ class TrueVoram(TreeBaseOram):
 
         self._read_path_into_stash(leaf=old_leaf)
 
-        old_value = self._decode_key_from_stash(key=key)
-        if value is not UNSET:
+        if key in self._stash:
+            old_value = self._decode_key_from_stash(key=key)
+        elif self._allow_dynamic_keys and is_write:
+            old_value = None
+        else:
+            raise KeyError(f"Key {key} not found in stash.")
+
+        if is_write:
             self._stash[key] = bytearray(self._encode_value(value))
             self._debug("deferred update staged: key=%d payload bytes=%d", key, len(self._stash[key]))
 
@@ -352,11 +415,27 @@ class TrueVoram(TreeBaseOram):
     def _stash_bytes(self) -> int:
         return sum(len(value) for value in self._stash.values())
 
+    def _validate_oram_key(self, key: int) -> int:
+        """Validate key type/range for vORAM addressing and chunk-id encoding."""
+        if not isinstance(key, int):
+            raise TypeError("TrueVoram keys must be integers.")
+        if key < 0:
+            raise KeyError(f"Key {key} not found in position map.")
+
+        max_key = (1 << (8 * self._idlen)) - 2
+        if key > max_key:
+            raise ValueError(
+                f"Key {key} exceeds representable range for idlen={self._idlen}; max key is {max_key}."
+            )
+
+        return key
+
        
     # key=0   → 0x0001
     # key=255 → 0x0100 (if idlen=2)
     # This way, 0x0000 = "empty slot"
     def _encode_ident(self, key: int) -> bytes:
+        key = self._validate_oram_key(key=key)
         return (key + 1).to_bytes(self._idlen, byteorder="big", signed=False)
  
     def _decode_ident(self, encoded: bytes) -> int:

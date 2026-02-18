@@ -367,3 +367,41 @@ class TestTrueVoram:
         # Source items should remain unchanged.
         assert oram.operate_on_key(key=key_x) == value_a
         assert oram.operate_on_key(key=key_y) == value_b
+
+    def test_dynamic_keys_without_pos_map(self, client):
+        oram = TrueVoram(
+            num_data=32,
+            data_size=8,
+            client=client,
+            optimize=False,
+            Z=1024,
+            compress=True,
+            allow_dynamic_keys=True,
+        )
+        oram.init_server_storage(data_map={})
+
+        dynamic_key = 120
+        with pytest.raises(KeyError):
+            oram.operate_on_key(key=dynamic_key)
+
+        assert oram.operate_on_key(key=dynamic_key, value={"dyn": True}) is None
+        assert oram.operate_on_key(key=dynamic_key) == {"dyn": True}
+
+    def test_dynamic_init_with_pos_map(self, client):
+        key = 200
+        value = {"payload": b"abc"}
+        pos_map = {key: 3}
+        data_map = {key: value}
+
+        oram = TrueVoram(
+            num_data=32,
+            data_size=8,
+            client=client,
+            optimize=False,
+            Z=1024,
+            compress=True,
+            allow_dynamic_keys=True,
+        )
+        oram.init_server_storage(data_map=data_map, pos_map=pos_map)
+
+        assert oram.operate_on_key(key=key) == value
