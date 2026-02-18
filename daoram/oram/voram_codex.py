@@ -131,6 +131,11 @@ class TrueVoram(TreeBaseOram):
         self._tmp_leaf: Optional[int] = None
         self._initialized: bool = False
         self._debug_enabled: bool = bool(DEBUG or debug)
+        self._logical_access_count: int = 0
+        self._read_path_count: int = 0
+        self._write_path_count: int = 0
+        self._client_round_count: int = 0
+        self._last_access: Optional[Dict[str, Any]] = None
 
         # Initialize a position map right away; init_server_storage resets it.
         self._init_pos_map()
@@ -147,6 +152,27 @@ class TrueVoram(TreeBaseOram):
         
 
     # --------------------------- Public API ---------------------------------
+
+    def reset_round_counters(self) -> None:
+        """Reset vORAM access counters."""
+        self._logical_access_count = 0
+        self._read_path_count = 0
+        self._write_path_count = 0
+        self._client_round_count = 0
+        self._last_access = None
+
+    def get_round_counters(self) -> Dict[str, int]:
+        """Return counters for ORAM paths and client/server execute rounds."""
+        return {
+            "logical_accesses": self._logical_access_count,
+            "path_reads": self._read_path_count,
+            "path_writes": self._write_path_count,
+            "client_rounds": self._client_round_count,
+        }
+
+    def get_last_access(self) -> Optional[Dict[str, Any]]:
+        """Return metadata for the most recent key access."""
+        return dict(self._last_access) if self._last_access is not None else None
 
     def init_server_storage(self, data_map: dict = None, pos_map: dict = None) -> None:
         """Initialize server storage and preload all keys."""
@@ -174,6 +200,7 @@ class TrueVoram(TreeBaseOram):
 
         self._tmp_leaf = None
         self._stash = {}
+        self.reset_round_counters()
         self._tree = BinaryTree(
             num_data=self._num_data,
             bucket_size=1,
@@ -232,6 +259,7 @@ class TrueVoram(TreeBaseOram):
         if self._tmp_leaf is not None:
             raise ValueError("A deferred access is pending; call eviction_with_update_stash first.")
 
+        self._logical_access_count += 1
         key = self._validate_oram_key(key=key)
         is_write = value is not UNSET
         if key in self._pos_map:
@@ -243,6 +271,13 @@ class TrueVoram(TreeBaseOram):
 
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
+        self._last_access = {
+            "key": key,
+            "is_write": is_write,
+            "old_leaf": old_leaf,
+            "new_leaf": new_leaf,
+            "deferred": False,
+        }
         self._debug(
             "operate_on_key: key=%d old_leaf=%d new_leaf=%d write=%s",
             key,
@@ -275,6 +310,7 @@ class TrueVoram(TreeBaseOram):
         if self._tmp_leaf is not None:
             raise ValueError("A deferred access is already pending.")
 
+        self._logical_access_count += 1
         key = self._validate_oram_key(key=key)
         is_write = value is not UNSET
         if key in self._pos_map:
@@ -286,6 +322,13 @@ class TrueVoram(TreeBaseOram):
 
         new_leaf = self._get_new_leaf()
         self._pos_map[key] = new_leaf
+        self._last_access = {
+            "key": key,
+            "is_write": is_write,
+            "old_leaf": old_leaf,
+            "new_leaf": new_leaf,
+            "deferred": True,
+        }
         self._debug(
             "operate_on_key_without_eviction: key=%d old_leaf=%d new_leaf=%d write=%s",
             key,
@@ -482,6 +525,8 @@ class TrueVoram(TreeBaseOram):
         self._debug("read_path start: leaf=%d", leaf)
         self.client.add_read_path(label=self._name, leaves=[leaf])
         result = self.client.execute()
+        self._read_path_count += 1
+        self._client_round_count += 1
         if not result.success:
             raise RuntimeError(result.error or "Failed to read path from server.")
         path_data: PathData = result.results[self._name]
@@ -643,9 +688,11 @@ class TrueVoram(TreeBaseOram):
             ciphertext = self._aes_encrypt(key=new_key, plaintext=plaintext)
             out_path[idx] = [ciphertext]
 
+        self._write_path_count += 1
         self.client.add_write_path(label=self._name, data=out_path)
         if execute:
             result = self.client.execute()
+            self._client_round_count += 1
             if not result.success:
                 raise RuntimeError(result.error or "Failed to write path to server.")
         self._debug("write_path done: leaf=%d nodes=%d stash=%d bytes", leaf, len(out_path), self._stash_bytes())

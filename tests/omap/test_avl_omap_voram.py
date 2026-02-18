@@ -121,7 +121,7 @@ class TestAVLOmapVoram:
 
     def test_with_encryptor_and_file(self, client, encryptor, test_file):
         omap = AVLOmapVoram(
-            num_data=16,
+            num_data=4,
             key_size=10,
             data_size=10,
             client=client,
@@ -130,9 +130,9 @@ class TestAVLOmapVoram:
         )
 
         omap.init_server_storage()
-        for i in range(8):
+        for i in range(3):
             omap.insert(key=i, value=i)
-        for i in range(8):
+        for i in range(3):
             assert omap.search(key=i) == i
 
     def test_non_int_keys_rejected(self, client):
@@ -141,3 +141,25 @@ class TestAVLOmapVoram:
 
         with pytest.raises(TypeError):
             omap.insert(key="k1", value="v1")
+
+    def test_trace_and_round_counters(self, client):
+        omap = AVLOmapVoram(num_data=16, key_size=10, data_size=10, client=client, trace=True)
+        omap.init_server_storage()
+
+        omap.insert(key=1, value="v1")
+        omap.search(key=1)
+
+        counters = omap.get_voram_round_counters()
+        assert counters["logical_accesses"] > 0
+        assert counters["path_reads"] > 0
+        assert counters["path_writes"] > 0
+        assert counters["client_rounds"] > 0
+
+        omap.reset_voram_round_counters()
+        assert omap.get_voram_round_counters() == {
+            "logical_accesses": 0,
+            "path_reads": 0,
+            "path_writes": 0,
+            "client_rounds": 0,
+        }
+

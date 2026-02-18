@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+from pickle import TRUE
 import secrets
 from typing import Any, Dict, List, Optional
 
-from daoram.dependency import AVLData, AVLTree, Data, Encryptor, InteractServer, KVPair
+from daoram.dependency import AVLData, AVLTree, Data, Encryptor, InteractServer, KVPair, UNSET
 from daoram.omap.avl_omap import AVLOmap
 from daoram.omap.oblivious_search_tree import KV_LIST, ROOT
 from daoram.oram import TrueVoram
+
+logger = logging.getLogger(__name__)
 
 
 class AVLOmapVoram(AVLOmap):
@@ -43,6 +47,7 @@ class AVLOmapVoram(AVLOmap):
             voram_suggested_params: bool = False,
             voram_suggested_nblobs: int = 4,
             voram_debug: bool = False,
+            trace: bool = True,
     ):
         super().__init__(
             num_data=num_data,
@@ -75,6 +80,174 @@ class AVLOmapVoram(AVLOmap):
             allow_dynamic_keys=True,
             debug=voram_debug,
         )
+        self._trace_enabled: bool = bool(trace or voram_debug)
+        self._node_visit_count: int = 0
+
+    def set_trace(self, enabled: bool = True) -> None:
+        """Enable/disable verbose traversal logs at runtime."""
+        self._trace_enabled = bool(enabled)
+
+    def get_voram_round_counters(self) -> Dict[str, int]:
+        """Expose vORAM path/client counters for diagnostics."""
+        return self._voram.get_round_counters()
+
+    def reset_voram_round_counters(self) -> None:
+        """Reset vORAM path/client counters."""
+        self._voram.reset_round_counters()
+
+    def _trace(self, msg: str, *args: Any) -> None:
+        if self._trace_enabled:
+            logger.info("[AVLOmapVoram] " + msg, *args)
+
+    @staticmethod
+    def _summarize_value(value: Any, max_len: int = 80) -> str:
+        """Compact value formatter for traversal logs."""
+        if isinstance(value, (bytes, bytearray)):
+            return f"<{type(value).__name__}:{len(value)}B>"
+        text = repr(value)
+        return text if len(text) <= max_len else text[: max_len - 3] + "..."
+
+    def _log_current_node(self, node: Data, source: str) -> None:
+        """Print current AVL node and child pointer metadata."""
+        self._node_visit_count += 1
+        self._trace(
+            (
+                "CURRENTLY AT AVL NODE #%d "
+                "(key=%s, value=%s) "
+                "(left_child: key=%s path=%s h=%s) "
+                "(right_child: key=%s path=%s h=%s) "
+                "[source=%s]"
+            ),
+            self._node_visit_count,
+            node.key,
+            self._summarize_value(node.value.value),
+            node.value.l_key,
+            node.value.l_leaf,
+            node.value.l_height,
+            node.value.r_key,
+            node.value.r_leaf,
+            node.value.r_height,
+            source,
+        )
+
+    def _log_fetch_request(self, key: Any, leaf: int, parent_key: Any) -> None:
+        """Print parent->child fetch direction and path hint."""
+        if parent_key is None:
+            self._trace("FETCHING ROOT NODE (key=%s) using path hint=%s", key, leaf)
+            return
+
+        parent = self._local.get(parent_key)
+        if parent is None:
+            self._trace("FETCHING CHILD (key=%s) from parent=%s using path hint=%s", key, parent_key, leaf)
+            return
+
+        if parent.value.l_key == key:
+            side = "LEFT"
+            edge_leaf = parent.value.l_leaf
+        elif parent.value.r_key == key:
+            side = "RIGHT"
+            edge_leaf = parent.value.r_leaf
+        else:
+            side = "UNKNOWN"
+            edge_leaf = leaf
+
+        self._trace(
+            "FETCHING %s CHILD (key=%s) from parent=%s (parent path pointer=%s)",
+            side,
+            key,
+            parent_key,
+            edge_leaf,
+        )
+
+    def _log_fetch_result(self, key: Any) -> None:
+        """Print vORAM leaf/path movement and round counters for last fetch."""
+        access = self._voram.get_last_access()
+        counters = self._voram.get_round_counters()
+        if access is None:
+            self._trace("vORAM FETCH for key=%s completed (no access metadata).", key)
+            return
+
+        self._trace(
+            (
+                "vORAM FETCHED PATH %s for key=%s -> remapped to path %s "
+                "[logical_ops=%d path_reads=%d path_writes=%d client_rounds=%d]"
+            ),
+            access.get("old_leaf"),
+            access.get("key", key),
+            access.get("new_leaf"),
+            counters["logical_accesses"],
+            counters["path_reads"],
+            counters["path_writes"],
+            counters["client_rounds"],
+        )
+
+    def _log_operation_start(self, op: str, key: Any, value: Any = None) -> Dict[str, int]:
+        """Log operation start and snapshot round counters."""
+        if value is UNSET:
+            self._trace("%s START key=%s", op, key)
+        else:
+            self._trace("%s START key=%s value=%s", op, key, self._summarize_value(value))
+        self._node_visit_count = 0
+        return self._voram.get_round_counters()
+
+    def _log_operation_end(
+            self,
+            op: str,
+            key: Any,
+            before: Dict[str, int],
+            result: Any = UNSET,
+            error: Exception | None = None,
+    ) -> None:
+        """Log per-operation round deltas and final status."""
+        after = self._voram.get_round_counters()
+        delta = {name: after[name] - before[name] for name in before.keys()}
+
+        if error is not None:
+            self._trace(
+                (
+                    "%s FAILED key=%s error=%s "
+                    "[delta logical_ops=%d path_reads=%d path_writes=%d client_rounds=%d visits=%d]"
+                ),
+                op,
+                key,
+                error,
+                delta["logical_accesses"],
+                delta["path_reads"],
+                delta["path_writes"],
+                delta["client_rounds"],
+                self._node_visit_count,
+            )
+            return
+
+        if result is UNSET:
+            self._trace(
+                (
+                    "%s DONE key=%s "
+                    "[delta logical_ops=%d path_reads=%d path_writes=%d client_rounds=%d visits=%d]"
+                ),
+                op,
+                key,
+                delta["logical_accesses"],
+                delta["path_reads"],
+                delta["path_writes"],
+                delta["client_rounds"],
+                self._node_visit_count,
+            )
+        else:
+            self._trace(
+                (
+                    "%s DONE key=%s result=%s "
+                    "[delta logical_ops=%d path_reads=%d path_writes=%d client_rounds=%d visits=%d]"
+                ),
+                op,
+                key,
+                self._summarize_value(result),
+                delta["logical_accesses"],
+                delta["path_reads"],
+                delta["path_writes"],
+                delta["client_rounds"],
+                self._node_visit_count,
+            )
 
     def _validate_voram_key(self, key: Any) -> int:
         """Validate that key is a legal vORAM index for direct pointer access."""
@@ -193,20 +366,29 @@ class AVLOmapVoram(AVLOmap):
     def _move_node_to_local_without_eviction(self, key: Any, leaf: int, parent_key: Any = None) -> None:
         """Move one node to local, preferring stash and falling back to direct vORAM fetch."""
         if self._local.get(key) is not None:
+            self._log_current_node(node=self._local.get(key), source="local-cache")
             return
 
         stash_idx = self._find_in_stash(key)
         if stash_idx >= 0:
-            self._local.add(node=self._stash.pop(stash_idx), parent_key=parent_key)
+            node = self._stash.pop(stash_idx)
+            self._local.add(node=node, parent_key=parent_key)
+            self._trace("FETCH HIT in AVL stash for key=%s (no vORAM round).", key)
+            self._log_current_node(node=node, source="avl-stash")
             return
 
-        self._local.add(node=self._read_node_from_voram(key=key), parent_key=parent_key)
+        self._log_fetch_request(key=key, leaf=leaf, parent_key=parent_key)
+        node = self._read_node_from_voram(key=key)
+        self._log_fetch_result(key=key)
+        self._local.add(node=node, parent_key=parent_key)
+        self._log_current_node(node=node, source="voram")
 
     def _perform_dummy_operation(self, num_round: int) -> None:
         """Persist pending nodes, then issue dummy vORAM accesses."""
         if num_round < 0:
             raise ValueError("The height is not enough, as the number of dummy operation required is negative.")
 
+        before = self._voram.get_round_counters()
         self._flush_stash_to_voram()
 
         existing_keys = list(self._voram._pos_map.keys())
@@ -215,19 +397,79 @@ class AVLOmapVoram(AVLOmap):
             self._voram.operate_on_key(key=0, value=self._EMPTY_SLOT_VALUE)
             existing_keys = [0]
 
-        for _ in range(num_round):
-            self._voram.operate_on_key(key=secrets.choice(existing_keys))
+        self._trace("DUMMY ROUND START rounds=%d candidate_keys=%d", num_round, len(existing_keys))
+        for i in range(num_round):
+            dummy_key = secrets.choice(existing_keys)
+            self._voram.operate_on_key(key=dummy_key)
+            access = self._voram.get_last_access()
+            if access is not None and self._trace_enabled:
+                if num_round <= 6 or i < 3 or i == num_round - 1:
+                    self._trace(
+                        "DUMMY ACCESS[%d/%d] key=%s fetched_path=%s new_path=%s",
+                        i + 1,
+                        num_round,
+                        dummy_key,
+                        access.get("old_leaf"),
+                        access.get("new_leaf"),
+                    )
+                elif i == 3:
+                    self._trace("... skipping %d intermediate dummy accesses ...", num_round - 4)
+
+        after = self._voram.get_round_counters()
+        self._trace(
+            (
+                "DUMMY ROUND DONE "
+                "[delta logical_ops=%d path_reads=%d path_writes=%d client_rounds=%d]"
+            ),
+            after["logical_accesses"] - before["logical_accesses"],
+            after["path_reads"] - before["path_reads"],
+            after["path_writes"] - before["path_writes"],
+            after["client_rounds"] - before["client_rounds"],
+        )
+
+    def insert(self, key: Any, value: Any = None) -> None:
+        before = self._log_operation_start(op="INSERT", key=key, value=value)
+        try:
+            super().insert(key=key, value=value)
+        except Exception as exc:
+            self._log_operation_end(op="INSERT", key=key, before=before, error=exc)
+            raise
+        self._log_operation_end(op="INSERT", key=key, before=before)
+
+    def search(self, key: Any, value: Any = None) -> Any:
+        before = self._log_operation_start(op="SEARCH", key=key, value=value if value is not None else UNSET)
+        try:
+            result = super().search(key=key, value=value)
+        except Exception as exc:
+            self._log_operation_end(op="SEARCH", key=key, before=before, error=exc)
+            raise
+        self._log_operation_end(op="SEARCH", key=key, before=before, result=result)
+        return result
 
     def fast_search(self, key: Any, value: Any = None) -> Any:
         """Functional-parity fast search implemented via the vORAM-safe search path."""
-        return self.search(key=key, value=value)
+        before = self._log_operation_start(op="FAST_SEARCH", key=key, value=value if value is not None else UNSET)
+        try:
+            result = super().search(key=key, value=value)
+        except Exception as exc:
+            self._log_operation_end(op="FAST_SEARCH", key=key, before=before, error=exc)
+            raise
+        self._log_operation_end(op="FAST_SEARCH", key=key, before=before, result=result)
+        return result
 
     def delete(self, key: Any) -> Any:
         """Delete key using AVL logic, then clear the deleted key slot in vORAM."""
+        before = self._log_operation_start(op="DELETE", key=key)
         if key is not None:
             self._validate_voram_key(key=key)
 
-        deleted_value = super().delete(key=key)
+        try:
+            deleted_value = super().delete(key=key)
+        except Exception as exc:
+            self._log_operation_end(op="DELETE", key=key, before=before, error=exc)
+            raise
         if deleted_value is not None:
+            self._trace("DELETE clearing vORAM slot for deleted key=%s", key)
             self._clear_node_from_voram(key=key)
+        self._log_operation_end(op="DELETE", key=key, before=before, result=deleted_value)
         return deleted_value
