@@ -304,6 +304,34 @@ class TrueVoram(TreeBaseOram):
         self._debug("operate_on_key complete: key=%d stash=%d bytes", key, self._stash_bytes())
         return old_value
 
+    def operate_dummy(self, leaf: Optional[int] = None) -> int:
+        """Perform one keyless dummy access by reading then rewriting one path."""
+        self._ensure_ready()
+        if self._tmp_leaf is not None:
+            raise ValueError("A deferred access is pending; call eviction_with_update_stash first.")
+
+        if leaf is None:
+            leaf = self._get_new_leaf()
+        elif not isinstance(leaf, int) or leaf < 0 or leaf >= self._leaf_range:
+            raise ValueError(f"Leaf {leaf} is out of range [0, {self._leaf_range}).")
+
+        self._logical_access_count += 1
+        self._last_access = {
+            "key": None,
+            "is_write": False,
+            "old_leaf": leaf,
+            "new_leaf": leaf,
+            "deferred": False,
+            "dummy": True,
+        }
+        self._debug("operate_dummy: leaf=%d", leaf)
+
+        self._read_path_into_stash(leaf=leaf)
+        self._enforce_stash_cap()
+        self._write_path_from_stash(leaf=leaf, execute=True)
+        self._debug("operate_dummy complete: leaf=%d stash=%d bytes", leaf, self._stash_bytes())
+        return leaf
+
     def operate_on_key_without_eviction(self, key: int, value: Any = UNSET) -> Any:
         """Read/write one key but defer eviction to eviction_with_update_stash."""
         self._ensure_ready()

@@ -245,8 +245,39 @@ class TestTrueVoram:
         with pytest.raises(ValueError):
             oram.operate_on_key(key=2)
 
+        with pytest.raises(ValueError):
+            oram.operate_dummy()
+
         oram.eviction_with_update_stash(key=1, value=123, execute=True)
         assert oram.operate_on_key(key=1) == 123
+
+    def test_operate_dummy_without_keys(self, client):
+        oram = TrueVoram(
+            num_data=32,
+            data_size=8,
+            client=client,
+            optimize=False,
+            Z=1024,
+            compress=True,
+            allow_dynamic_keys=True,
+        )
+        oram.init_server_storage(data_map={})
+
+        before = oram.get_round_counters()
+        leaf = oram.operate_dummy()
+        after = oram.get_round_counters()
+
+        assert 0 <= leaf < oram._leaf_range
+        assert after["logical_accesses"] - before["logical_accesses"] == 1
+        assert after["path_reads"] - before["path_reads"] == 1
+        assert after["path_writes"] - before["path_writes"] == 1
+        assert after["client_rounds"] - before["client_rounds"] == 2
+
+        last_access = oram.get_last_access()
+        assert last_access is not None
+        assert last_access["dummy"] is True
+        assert last_access["key"] is None
+        assert last_access["old_leaf"] == leaf
 
     
     def test_eviction_with_missing_stash_key_raises(self, client):

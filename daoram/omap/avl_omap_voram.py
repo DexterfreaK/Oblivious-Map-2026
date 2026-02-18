@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from pickle import TRUE
-import secrets
 from typing import Any, Dict, List, Optional
 
 from daoram.dependency import AVLData, AVLTree, Data, Encryptor, InteractServer, KVPair, UNSET
@@ -133,12 +132,12 @@ class AVLOmapVoram(AVLOmap):
     def _log_fetch_request(self, key: Any, leaf: int, parent_key: Any) -> None:
         """Print parent->child fetch direction and path hint."""
         if parent_key is None:
-            self._trace("FETCHING ROOT NODE (key=%s) using path hint=%s", key, leaf)
+            self._trace("FETCHING ROOT NODE (key=%s) using path hint/leaf=%s", key, leaf)
             return
 
         parent = self._local.get(parent_key)
         if parent is None:
-            self._trace("FETCHING CHILD (key=%s) from parent=%s using path hint=%s", key, parent_key, leaf)
+            self._trace("FETCHING CHILD (key=%s) from parent=%s using path hint/leaf=%s", key, parent_key, leaf)
             return
 
         if parent.value.l_key == key:
@@ -391,26 +390,17 @@ class AVLOmapVoram(AVLOmap):
         before = self._voram.get_round_counters()
         self._flush_stash_to_voram()
 
-        existing_keys = list(self._voram._pos_map.keys())
-        if not existing_keys:
-            # Bootstrap one inert key so we can still issue fixed-round dummy accesses.
-            self._voram.operate_on_key(key=0, value=self._EMPTY_SLOT_VALUE)
-            existing_keys = [0]
-
-        self._trace("DUMMY ROUND START rounds=%d candidate_keys=%d", num_round, len(existing_keys))
+        self._trace("DUMMY ROUND START rounds=%d leaf_range=%d", num_round, self._leaf_range)
         for i in range(num_round):
-            dummy_key = secrets.choice(existing_keys)
-            self._voram.operate_on_key(key=dummy_key)
+            self._voram.operate_dummy()
             access = self._voram.get_last_access()
             if access is not None and self._trace_enabled:
                 if num_round <= 6 or i < 3 or i == num_round - 1:
                     self._trace(
-                        "DUMMY ACCESS[%d/%d] key=%s fetched_path=%s new_path=%s",
+                        "DUMMY ACCESS[%d/%d] leaf=%s",
                         i + 1,
                         num_round,
-                        dummy_key,
                         access.get("old_leaf"),
-                        access.get("new_leaf"),
                     )
                 elif i == 3:
                     self._trace("... skipping %d intermediate dummy accesses ...", num_round - 4)

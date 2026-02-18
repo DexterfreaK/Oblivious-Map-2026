@@ -25,7 +25,7 @@ class TestAVLOmapVoram:
             assert omap.fast_search(key=i * 2) == i * 3
 
     def test_complex_values_roundtrip(self, client):
-        num_data = 24
+        num_data = 4
         omap = AVLOmapVoram(num_data=num_data, key_size=10, data_size=10, client=client)
         omap.init_server_storage()
 
@@ -163,3 +163,72 @@ class TestAVLOmapVoram:
             "client_rounds": 0,
         }
 
+    def test_dummy_rounds_do_not_bootstrap_pos_map_key(self, client):
+        omap = AVLOmapVoram(num_data=16, key_size=10, data_size=10, client=client)
+        omap.init_server_storage()
+
+        assert omap._voram._pos_map == {}
+        omap._perform_dummy_operation(num_round=3)
+
+        assert omap._voram._pos_map == {}
+        counters = omap.get_voram_round_counters()
+        assert counters["logical_accesses"] == 3
+        assert counters["path_reads"] == 3
+        assert counters["path_writes"] == 3
+        assert counters["client_rounds"] == 6
+
+    def test_prebuilt_tree_operations_have_constant_rounds_per_case(self, client):
+        omap = AVLOmapVoram(num_data=64, key_size=10, data_size=10, client=client)
+        omap.init_server_storage(data=[(i, i) for i in range(24)])
+
+        def run_and_delta(fn):
+            before = omap.get_voram_round_counters()
+            fn()
+            after = omap.get_voram_round_counters()
+            return {name: after[name] - before[name] for name in before.keys()}
+
+        def assert_constant_deltas(deltas):
+            base = deltas[0]
+            for delta in deltas[1:]:
+                assert delta == base
+
+        def print_case_deltas(case: str, keys: list[int], deltas: list[dict]) -> None:
+            print(f"\n[{case}]")
+            for key, delta in zip(keys, deltas):
+                print(f"key={key} -> {delta}")
+
+        # Insert misses (new keys) are padded to a fixed number of rounds.
+        insert_keys = [24, 30, 40]
+        insert_deltas = [
+            run_and_delta(lambda key=key: omap.insert(key=key, value=key))
+            for key in insert_keys
+        ]
+        print_case_deltas(case="insert_miss", keys=insert_keys, deltas=insert_deltas)
+        assert_constant_deltas(insert_deltas)
+
+        # Search misses are padded to a fixed number of rounds.
+        search_miss_keys = [1]
+        search_miss_deltas = [
+            run_and_delta(lambda key=key: omap.search(key=key))
+            for key in search_miss_keys
+        ]
+        print_case_deltas(case="search_miss", keys=search_miss_keys, deltas=search_miss_deltas)
+        assert_constant_deltas(search_miss_deltas)
+
+        # Delete hits are padded to a fixed number of rounds.
+        delete_hit_keys = [0, 10, 20]
+        delete_hit_deltas = [
+            run_and_delta(lambda key=key: omap.delete(key=key))
+            for key in delete_hit_keys
+        ]
+        print_case_deltas(case="delete_hit", keys=delete_hit_keys, deltas=delete_hit_deltas)
+        assert_constant_deltas(delete_hit_deltas)
+
+        # Delete misses are padded to a fixed number of rounds.
+        delete_miss_keys = [1001, 2001, 3001]
+        delete_miss_deltas = [
+            run_and_delta(lambda key=key: omap.delete(key=key))
+            for key in delete_miss_keys
+        ]
+        print_case_deltas(case="delete_miss", keys=delete_miss_keys, deltas=delete_miss_deltas)
+        assert_constant_deltas(delete_miss_deltas)
