@@ -1,6 +1,19 @@
 import math
 
+from daoram.dependency import InteractLocalServer
 from daoram.omap import AVLOmap
+
+
+class RoundCountingInteractLocalServer(InteractLocalServer):
+    """Local client/server adapter that counts execute() calls as communication rounds."""
+
+    def __init__(self):
+        super().__init__()
+        self.total_rounds = 0
+
+    def execute(self):
+        self.total_rounds += 1
+        return super().execute()
 
 
 class TestAVLOmap:
@@ -154,3 +167,50 @@ class TestAVLOmap:
             # Fast search for data in this root.
             for j in range(i * 2 * size_group, (i * 2 + 1) * size_group + extra):
                 assert omap.fast_search(key=j) == j
+
+    def test_total_rounds_per_operation(self):
+        # Keep this test compact while still covering all requested operations.
+        num_data = 64
+        num_ops = 8
+
+        client = RoundCountingInteractLocalServer()
+        omap = AVLOmap(num_data=num_data, key_size=10, data_size=10, client=client)
+        omap.init_server_storage()
+
+        round_totals = {
+            "insert": 0,
+            "search": 0,
+            "update": 0,
+            "delete": 0,
+        }
+
+        for i in range(num_ops):
+            before = client.total_rounds
+            omap.insert(key=i, value=i)
+            round_totals["insert"] += client.total_rounds - before
+
+        for i in range(num_ops):
+            before = client.total_rounds
+            assert omap.search(key=i) == i
+            round_totals["search"] += client.total_rounds - before
+
+        for i in range(num_ops):
+            before = client.total_rounds
+            assert omap.search(key=i, value=i * 10) == i
+            round_totals["update"] += client.total_rounds - before
+
+        for i in range(num_ops):
+            before = client.total_rounds
+            assert omap.delete(key=i) == i * 10
+            round_totals["delete"] += client.total_rounds - before
+
+        print(
+            "Total client/server rounds "
+            f"(insert={round_totals['insert']}, "
+            f"search={round_totals['search']}, "
+            f"update={round_totals['update']}, "
+            f"delete={round_totals['delete']})"
+        )
+
+        for operation, total in round_totals.items():
+            assert total > 0

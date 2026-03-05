@@ -163,3 +163,49 @@ class TestAVLOmapVoram:
             "client_rounds": 0,
         }
 
+    def test_total_rounds_per_operation(self, client):
+        # Keep this test compact while still covering all requested operations.
+        num_data = 64
+        num_ops = 8
+
+        omap = AVLOmapVoram(num_data=num_data, key_size=10, data_size=10, client=client, trace=False)
+        omap.init_server_storage()
+        omap.reset_voram_round_counters()
+
+        round_totals = {
+            "insert": 0,
+            "search": 0,
+            "update": 0,
+            "delete": 0,
+        }
+
+        for i in range(num_ops):
+            before = omap.get_voram_round_counters()["client_rounds"]
+            omap.insert(key=i, value=i)
+            round_totals["insert"] += omap.get_voram_round_counters()["client_rounds"] - before
+
+        for i in range(num_ops):
+            before = omap.get_voram_round_counters()["client_rounds"]
+            assert omap.search(key=i) == i
+            round_totals["search"] += omap.get_voram_round_counters()["client_rounds"] - before
+
+        for i in range(num_ops):
+            before = omap.get_voram_round_counters()["client_rounds"]
+            assert omap.search(key=i, value=i * 10) == i
+            round_totals["update"] += omap.get_voram_round_counters()["client_rounds"] - before
+
+        for i in range(num_ops):
+            before = omap.get_voram_round_counters()["client_rounds"]
+            assert omap.delete(key=i) == i * 10
+            round_totals["delete"] += omap.get_voram_round_counters()["client_rounds"] - before
+
+        print(
+            "Total client/server rounds "
+            f"(insert={round_totals['insert']}, "
+            f"search={round_totals['search']}, "
+            f"update={round_totals['update']}, "
+            f"delete={round_totals['delete']})"
+        )
+
+        for operation, total in round_totals.items():
+            assert total > 0
