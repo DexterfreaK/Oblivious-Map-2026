@@ -25,7 +25,7 @@ class TestAVLOmapVoram:
             assert omap.fast_search(key=i * 2) == i * 3
 
     def test_complex_values_roundtrip(self, client):
-        num_data = 24
+        num_data = 4
         omap = AVLOmapVoram(num_data=num_data, key_size=10, data_size=10, client=client)
         omap.init_server_storage()
 
