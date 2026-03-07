@@ -1,0 +1,260 @@
+{
+  "benchmark": {
+    "summary": {
+      "cold": {
+        "avg_bandwidth_bytes_total": 0.0,
+        "avg_bytes_read": 0.0,
+        "avg_bytes_written": 0.0,
+        "avg_rounds": 0.0,
+        "correct_count": 0,
+        "count": 0,
+        "incorrect_count": 0,
+        "lower_tail_bandwidth_bytes_total_p05": 0.0,
+        "lower_tail_rounds_p05": 0.0,
+        "max_bandwidth_bytes_total": 0.0,
+        "max_rounds": 0.0,
+        "min_bandwidth_bytes_total": 0.0,
+        "min_rounds": 0.0,
+        "upper_tail_bandwidth_bytes_total_p95": 0.0,
+        "upper_tail_rounds_p95": 0.0,
+        "was_hot_before_false_count": 0,
+        "was_hot_before_true_count": 0,
+        "was_hot_before_true_fraction": 0.0
+      },
+      "hot": {
+        "avg_bandwidth_bytes_total": 47.45,
+        "avg_bytes_read": 28.45,
+        "avg_bytes_written": 19.0,
+        "avg_rounds": 0.1,
+        "correct_count": 20,
+        "count": 20,
+        "incorrect_count": 0,
+        "lower_tail_bandwidth_bytes_total_p05": 0.0,
+        "lower_tail_rounds_p05": 0.0,
+        "max_bandwidth_bytes_total": 949.0,
+        "max_rounds": 2.0,
+        "min_bandwidth_bytes_total": 0.0,
+        "min_rounds": 0.0,
+        "upper_tail_bandwidth_bytes_total_p95": 47.45000000000067,
+        "upper_tail_rounds_p95": 0.10000000000000142,
+        "was_hot_before_false_count": 1,
+        "was_hot_before_true_count": 19,
+        "was_hot_before_true_fraction": 0.95
+      },
+      "warmup": {
+        "avg_bandwidth_bytes_total": 950.1,
+        "avg_bytes_read": 658.9,
+        "avg_bytes_written": 291.2,
+        "avg_rounds": 2.6,
+        "correct_count": 10,
+        "count": 10,
+        "incorrect_count": 0,
+        "lower_tail_bandwidth_bytes_total_p05": 0.0,
+        "lower_tail_rounds_p05": 0.0,
+        "max_bandwidth_bytes_total": 3181.0,
+        "max_rounds": 10.0,
+        "min_bandwidth_bytes_total": 0.0,
+        "min_rounds": 0.0,
+        "upper_tail_bandwidth_bytes_total_p95": 2886.699999999999,
+        "upper_tail_rounds_p95": 8.199999999999996,
+        "was_hot_before_false_count": 6,
+        "was_hot_before_true_count": 4,
+        "was_hot_before_true_fraction": 0.4
+      }
+    }
+  },
+  "cache_aggregate": {
+    "height_distribution": [
+      {
+        "height": 1,
+        "observation_count": 148,
+        "percentage_of_cache_node_observations": 39.67828418230563
+      },
+      {
+        "height": 2,
+        "observation_count": 107,
+        "percentage_of_cache_node_observations": 28.68632707774799
+      },
+      {
+        "height": 3,
+        "observation_count": 58,
+        "percentage_of_cache_node_observations": 15.549597855227882
+      },
+      {
+        "height": 4,
+        "observation_count": 30,
+        "percentage_of_cache_node_observations": 8.04289544235925
+      },
+      {
+        "height": 6,
+        "observation_count": 30,
+        "percentage_of_cache_node_observations": 8.04289544235925
+      }
+    ],
+    "snapshot_count": 30,
+    "top_accessed_cache_nodes": [
+      {
+        "access_count": 31,
+        "key": 15,
+        "last_seen_height": 6,
+        "present_in_snapshots_count": 30,
+        "present_in_snapshots_fraction": 1.0
+      },
+      {
+        "access_count": 28,
+        "key": 7,
+        "last_seen_height": 4,
+        "present_in_snapshots_count": 30,
+        "present_in_snapshots_fraction": 1.0
+      },
+      {
+        "access_count": 16,
+        "key": 3,
+        "last_seen_height": 3,
+        "present_in_snapshots_count": 30,
+        "present_in_snapshots_fraction": 1.0
+      },
+      {
+        "access_count": 12,
+        "key": 11,
+        "last_seen_height": 3,
+        "present_in_snapshots_count": 28,
+        "present_in_snapshots_fraction": 0.9333333333333333
+      },
+      {
+        "access_count": 8,
+        "key": 5,
+        "last_seen_height": 2,
+        "present_in_snapshots_count": 30,
+        "present_in_snapshots_fraction": 1.0
+      },
+      {
+        "access_count": 8,
+        "key": 13,
+        "last_seen_height": 2,
+        "present_in_snapshots_count": 26,
+        "present_in_snapshots_fraction": 0.8666666666666667
+      },
+      {
+        "access_count": 6,
+        "key": 1,
+        "last_seen_height": 2,
+        "present_in_snapshots_count": 23,
+        "present_in_snapshots_fraction": 0.7666666666666667
+      },
+      {
+        "access_count": 5,
+        "key": 4,
+        "last_seen_height": 1,
+        "present_in_snapshots_count": 30,
+        "present_in_snapshots_fraction": 1.0
+      },
+      {
+        "access_count": 5,
+        "key": 14,
+        "last_seen_height": 1,
+        "present_in_snapshots_count": 26,
+        "present_in_snapshots_fraction": 0.8666666666666667
+      },
+      {
+        "access_count": 4,
+        "key": 9,
+        "last_seen_height": 2,
+        "present_in_snapshots_count": 28,
+        "present_in_snapshots_fraction": 0.9333333333333333
+      }
+    ],
+    "total_cache_node_observations": 373
+  },
+  "client_observability": {
+    "bytes_read": 468130,
+    "bytes_written": 340021,
+    "rounds": 2310
+  },
+  "coldset_keys": [
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "config": {
+    "always_dummy_after_search": false,
+    "cache_size": 18,
+    "coldset_size": 16,
+    "hot_query_probability": 1.0,
+    "hot_threshold": 1,
+    "hotset_fraction": 0.5,
+    "hotset_mode": "range",
+    "hotset_range_start": 0,
+    "hotset_size": 16,
+    "insert_count": 32,
+    "num_data": 256,
+    "num_queries": 20,
+    "payload_size": 32,
+    "search_padding": false,
+    "seed": 14,
+    "warmup_accesses": 10
+  },
+  "hot_cache_stats": {
+    "evictions": 0,
+    "hits": 106,
+    "misses": 28,
+    "promotions": 14
+  },
+  "hotset_keys": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "operation_observability": {
+    "insert": {
+      "bytes_read": 460972,
+      "bytes_written": 336729,
+      "count": 32,
+      "failure": 0,
+      "hot_evictions": 0,
+      "hot_hits": 0,
+      "hot_misses": 0,
+      "hot_promotions": 0,
+      "rounds": 2282,
+      "success": 32
+    },
+    "search": {
+      "bytes_read": 7158,
+      "bytes_written": 3292,
+      "count": 30,
+      "failure": 0,
+      "hot_evictions": 0,
+      "hot_hits": 106,
+      "hot_misses": 28,
+      "hot_promotions": 14,
+      "rounds": 28,
+      "success": 30
+    }
+  }
+}

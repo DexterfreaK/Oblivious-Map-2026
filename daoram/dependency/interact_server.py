@@ -36,6 +36,7 @@ class InteractServer(ABC):
         # Bandwidth counters (serialized bytes).
         self._bytes_read: int = 0
         self._bytes_written: int = 0
+        self._client_rounds: int = 0
 
     def clear_queries(self) -> None:
         """Clear all pending queries."""
@@ -56,6 +57,14 @@ class InteractServer(ABC):
         """Reset bandwidth counters to zero."""
         self._bytes_read = 0
         self._bytes_written = 0
+
+    def get_rounds(self) -> int:
+        """Return number of execute() rounds issued by this client."""
+        return self._client_rounds
+
+    def reset_rounds(self) -> None:
+        """Reset execute() round counter to zero."""
+        self._client_rounds = 0
 
     def add_read_path(self, label: str, leaves: List[int]) -> None:
         """Add path read query. Multiple calls with same label accumulate leaves."""
@@ -164,6 +173,7 @@ class InteractLocalServer(InteractServer):
 
     def execute(self) -> ExecuteResult:
         """Execute all pending queries (writes first, then reads)."""
+        self._client_rounds += 1
         try:
             results = {}
 
@@ -263,6 +273,7 @@ class InteractRemoteServer(InteractServer):
     def execute(self) -> ExecuteResult:
         """Execute all pending queries on the remote server."""
         self._check_client()
+        self._client_rounds += 1
 
         # Package all queries into a single request.
         request = {

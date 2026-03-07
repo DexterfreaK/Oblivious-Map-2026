@@ -1,5 +1,7 @@
 from .avl_omap import AVLOmap
 from .avl_omap_cache import AVLOmapCached
+from .avl_omap_hot import AVLOmapHotNodesClient
+from .avl_omap_hot_benchmark import AVLOmapHotNodesBenchmark
 from .avl_omap_voram import AVLOmapVoram
 from .bplus_omap import BPlusOmap
 from .bplus_omap_cache import BPlusOmapCached
