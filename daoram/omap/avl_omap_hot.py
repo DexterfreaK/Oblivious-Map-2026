@@ -1,6 +1,7 @@
 """AVL OMAP wrapper with a client-only hot-node cache."""
 
 import copy
+import random
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Set
 
@@ -66,6 +67,8 @@ class AVLOmapHotNodesClient(AVLOmap):
         self.hot_cache_promotions = 0
         self.hot_cache_evictions = 0
         self._pending_reinsert_nodes: Dict[Any, Data] = {}
+        self._dummy_walk_active = False
+        self._dummy_walk_oram_keys: Set[Any] = set()
 
         # Per-operation observability.
         self._operation_totals: Dict[str, Dict[str, int]] = {}
@@ -186,6 +189,9 @@ class AVLOmapHotNodesClient(AVLOmap):
 
     def _record_access(self, key: Any, parent_key: Any) -> None:
         """Update access metadata and stage candidates for deferred promotion."""
+        if self._dummy_walk_active:
+            return
+
         self._access_counts[key] = self._access_counts.get(key, 0) + 1
 
         if key in self._hot_nodes_client:
@@ -257,6 +263,93 @@ class AVLOmapHotNodesClient(AVLOmap):
             return
 
         super()._move_node_to_local(key=key, leaf=leaf, parent_key=parent_key)
+
+    def _fetch_node_for_dummy_walk(self, key: Any, leaf: int, parent_key: Any = None) -> None:
+        """
+        Fetch a node for dummy random-walk traversal with frozen cache metadata.
+
+        Resolution order:
+        1. Local nodes already fetched in this walk.
+        2. Hot client cache.
+        3. Pending reinsert map.
+        4. ORAM.
+        """
+        if self._local.get(key) is not None:
+            return
+
+        cached = self._hot_nodes_client.get(key)
+        if cached is not None:
+            self._local.add(node=copy.deepcopy(cached), parent_key=parent_key)
+            return
+
+        pending = self._pending_reinsert_nodes.get(key)
+        if pending is not None:
+            self._local.add(node=copy.deepcopy(pending), parent_key=parent_key)
+            return
+
+        super()._move_node_to_local(key=key, leaf=leaf, parent_key=parent_key)
+        self._dummy_walk_oram_keys.add(key)
+
+    def _flush_dummy_walk_local(self) -> None:
+        """
+        Flush ORAM-fetched dummy-walk nodes back to stash and clear local.
+
+        Nodes sourced from hot cache/pending map are intentionally not written
+        back so client cache membership/order and pending metadata stay frozen.
+        """
+        if not self._local:
+            return
+
+        for local_node in self._local.to_list():
+            if local_node.key in self._dummy_walk_oram_keys:
+                self._stash.append(local_node)
+
+        if len(self._stash) > self._stash_size:
+            raise MemoryError("Stash overflow while running dummy random walk.")
+
+        self._local.clear()
+
+    def _random_walk_to_avl_leaf(self, start_key: Any, start_leaf: int) -> None:
+        """
+        Perform a random AVL tail walk from a start node to a leaf.
+
+        The walk is cache-aware:
+        - cache/pending hits are served client-side (no ORAM round),
+        - ORAM misses trigger real path access.
+
+        All hot-cache metadata/counters remain frozen during this walk.
+        """
+        if start_key is None:
+            return
+
+        self._dummy_walk_active = True
+        self._dummy_walk_oram_keys.clear()
+
+        try:
+            self._fetch_node_for_dummy_walk(key=start_key, leaf=start_leaf, parent_key=None)
+            current_key = start_key
+
+            # Safety bound guards against malformed links introducing cycles.
+            for _ in range(self._max_height + 1):
+                current = self._local.get(current_key)
+                children = []
+                if current.value.l_key is not None:
+                    children.append((current.value.l_key, current.value.l_leaf))
+                if current.value.r_key is not None:
+                    children.append((current.value.r_key, current.value.r_leaf))
+
+                if not children:
+                    break
+
+                next_key, next_leaf = random.choice(children)
+                self._fetch_node_for_dummy_walk(key=next_key, leaf=next_leaf, parent_key=current_key)
+                current_key = next_key
+
+            self._flush_dummy_walk_local()
+        finally:
+            self._local.clear()
+            self._dummy_walk_oram_keys.clear()
+            self._dummy_walk_active = False
 
     def _update_parent_leaf_for_key(self, child_key: Any, child_new_leaf: int) -> None:
         """
@@ -347,8 +440,8 @@ class AVLOmapHotNodesClient(AVLOmap):
         self._client.add_write_path(label=self._name, data=self._evict_stash(leaves=[remapped_node.leaf]))
         self._client.execute()
 
-        # Add a random tail traversal after reinsertion to reduce distinguishability.
-        self._perform_dummy_operation(num_round=self._max_height)
+        # Add a random AVL-tail traversal after reinsertion.
+        self._random_walk_to_avl_leaf(start_key=remapped_node.key, start_leaf=remapped_node.leaf)
         self._pending_reinsert_nodes.pop(remapped_node.key, None)
 
     def _flush_hot_nodes_to_oram(self) -> None:
@@ -360,7 +453,7 @@ class AVLOmapHotNodesClient(AVLOmap):
         self._hot_nodes_client.clear()
         self._temp_hot_nodes.clear()
         self._hot_parent_links.clear()
-        self._pending_reinsert_nodes.clear()
+        self._pending_reinsert_nodes = {node.key: copy.deepcopy(node) for node in hot_nodes}
 
         for node in hot_nodes:
             self._reinsert_evicted_hot_node(node=copy.deepcopy(node))
@@ -421,11 +514,13 @@ class AVLOmapHotNodesClient(AVLOmap):
         cached = self._hot_nodes_client.get(key)
         if cached is not None:
             self._local.add(node=copy.deepcopy(cached), parent_key=parent_key)
-            self.hot_cache_hits += 1
+            if not self._dummy_walk_active:
+                self.hot_cache_hits += 1
             self._record_access(key=key, parent_key=parent_key)
             return
 
-        self.hot_cache_misses += 1
+        if not self._dummy_walk_active:
+            self.hot_cache_misses += 1
         super()._move_node_to_local(key=key, leaf=leaf, parent_key=parent_key)
         self._record_access(key=key, parent_key=parent_key)
 
@@ -443,11 +538,13 @@ class AVLOmapHotNodesClient(AVLOmap):
         cached = self._hot_nodes_client.get(key)
         if cached is not None:
             self._local.add(node=copy.deepcopy(cached), parent_key=parent_key)
-            self.hot_cache_hits += 1
+            if not self._dummy_walk_active:
+                self.hot_cache_hits += 1
             self._record_access(key=key, parent_key=parent_key)
             return
 
-        self.hot_cache_misses += 1
+        if not self._dummy_walk_active:
+            self.hot_cache_misses += 1
         super()._move_node_to_local_without_eviction(key=key, leaf=leaf, parent_key=parent_key)
         self._record_access(key=key, parent_key=parent_key)
 
@@ -549,11 +646,12 @@ class AVLOmapHotNodesClient(AVLOmap):
 
             # Keep the leaf-update behavior compatible with AVLOmap.
             self._local.update_all_leaves(self._get_new_leaf)
+            tail_start_key = node.key
+            tail_start_leaf = node.leaf
 
             root_node = self._local.get_root()
             self.root = (root_node.key, root_node.leaf)
 
-            num_retrieved_nodes = len(self._local)
             local_by_key = {node.key: node for node in self._local.to_list()}
 
             # Deferred promotion + bounded eviction.
@@ -574,10 +672,9 @@ class AVLOmapHotNodesClient(AVLOmap):
                 self._reinsert_evicted_hot_node(node=evicted)
 
             if self._search_padding:
-                dummy_rounds = 3 * self._max_height + 1 - num_retrieved_nodes
+                self._random_walk_to_avl_leaf(start_key=tail_start_key, start_leaf=tail_start_leaf)
                 if self._always_dummy_after_search:
-                    dummy_rounds += 1
-                self._perform_dummy_operation(num_round=dummy_rounds)
+                    self._random_walk_to_avl_leaf(start_key=tail_start_key, start_leaf=tail_start_leaf)
 
             success = True
             return search_value

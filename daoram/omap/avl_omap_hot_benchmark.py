@@ -491,8 +491,8 @@ class AVLOmapHotNodesBenchmarkMain:
                 "search_padding": args.search_padding,
                 "always_dummy_after_search": args.always_dummy_after_search,
             },
-            "hotset_keys": hotset_keys,
-            "coldset_keys": coldset_keys,
+            # "hotset_keys": hotset_keys,
+            # "coldset_keys": coldset_keys,
             "benchmark": {
                 "summary": benchmark_summary,
             },
