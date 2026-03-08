@@ -191,7 +191,7 @@ class TestAVLOmap:
 
         for i in range(num_ops):
             before = client.total_rounds
-            assert omap.search(key=i) == i
+            assert omap.fast_search(key=i) == i
             round_totals["search"] += client.total_rounds - before
 
         for i in range(num_ops):

@@ -16,6 +16,7 @@ if __package__ in (None, ""):
         sys.path.insert(0, ROOT_DIR)
 
 from daoram.dependency import InteractLocalServer
+from daoram.omap.avl_omap import AVLOmap
 from daoram.omap.avl_omap_hot import AVLOmapHotNodesClient
 
 
@@ -405,6 +406,151 @@ class AVLOmapHotNodesBenchmarkMain:
         return parser
 
     @staticmethod
+    def _snapshot_client(client: InteractLocalServer) -> Dict[str, int]:
+        """Snapshot bandwidth and round counters from a local benchmark client."""
+        bytes_read, bytes_written = client.get_bandwidth()
+        rounds = client.get_rounds() if hasattr(client, "get_rounds") else 0
+        return {
+            "bytes_read": bytes_read,
+            "bytes_written": bytes_written,
+            "rounds": rounds,
+        }
+
+    @staticmethod
+    def _measure_avl_fast_search_once(
+        omap: AVLOmap,
+        client: InteractLocalServer,
+        key: Any,
+        label: str,
+        expected_value: Any = None,
+    ) -> Dict[str, Any]:
+        """Measure one plain-AVLOmap fast_search trial for a key."""
+        before = AVLOmapHotNodesBenchmarkMain._snapshot_client(client=client)
+        result = omap.fast_search(key=key)
+        after = AVLOmapHotNodesBenchmarkMain._snapshot_client(client=client)
+        delta = AVLOmapHotNodesBenchmark._delta(after=after, before=before)
+        correct = True if expected_value is None else (result == expected_value)
+
+        if isinstance(result, (bytes, bytearray)):
+            result_size = len(result)
+        else:
+            result_size = None if result is None else len(str(result))
+
+        return {
+            "label": label,
+            "key": key,
+            "was_hot_before": False,
+            "is_hot_after": False,
+            "result_type": type(result).__name__,
+            "result_size_bytes": result_size,
+            "correct": correct,
+            **delta,
+        }
+
+    @staticmethod
+    def _benchmark_avl_fast_search_workload(
+        args: argparse.Namespace,
+        keys: List[int],
+        payloads: Dict[int, bytes],
+        hotset_keys: List[int],
+        coldset_keys: List[int],
+        rng: random.Random,
+        bench: AVLOmapHotNodesBenchmark,
+    ) -> Dict[str, Any]:
+        """Run the exact same warmup/query workload on plain AVLOmap.fast_search."""
+        client = InteractLocalServer()
+        omap = AVLOmap(
+            num_data=args.num_data,
+            key_size=10,
+            data_size=max(10, args.payload_size),
+            client=client,
+        )
+        omap.init_server_storage()
+
+        for key in keys:
+            omap.insert(key=key, value=payloads[key])
+
+        warmup_trials: List[Dict[str, Any]] = []
+        for _ in range(args.warmup_accesses):
+            key = rng.choice(hotset_keys)
+            trial = AVLOmapHotNodesBenchmarkMain._measure_avl_fast_search_once(
+                omap=omap,
+                client=client,
+                key=key,
+                label="warmup",
+                expected_value=payloads[key],
+            )
+            warmup_trials.append(trial)
+            if not trial["correct"]:
+                raise AssertionError(f"AVLOmap.fast_search warmup correctness failure for key={key}.")
+
+        hot_trials: List[Dict[str, Any]] = []
+        cold_trials: List[Dict[str, Any]] = []
+        for _ in range(args.num_queries):
+            use_hot = rng.random() < args.hot_query_probability
+            key = rng.choice(hotset_keys) if use_hot else rng.choice(coldset_keys)
+            label = "hot" if use_hot else "cold"
+
+            trial = AVLOmapHotNodesBenchmarkMain._measure_avl_fast_search_once(
+                omap=omap,
+                client=client,
+                key=key,
+                label=label,
+                expected_value=payloads[key],
+            )
+            if not trial["correct"]:
+                raise AssertionError(f"AVLOmap.fast_search benchmark correctness failure for key={key}.")
+
+            if use_hot:
+                hot_trials.append(trial)
+            else:
+                cold_trials.append(trial)
+
+        return {
+            "summary": {
+                "warmup": bench._summarize_trials(warmup_trials),
+                "hot": bench._summarize_trials(hot_trials),
+                "cold": bench._summarize_trials(cold_trials),
+            },
+            "client_observability": AVLOmapHotNodesBenchmarkMain._snapshot_client(client=client),
+        }
+
+    @staticmethod
+    def _build_summary_comparison(
+        hot_summary: Dict[str, Dict[str, float]],
+        avl_fast_summary: Dict[str, Dict[str, float]],
+    ) -> Dict[str, Dict[str, Optional[float]]]:
+        """Build side-by-side deltas and ratios against plain AVLOmap.fast_search."""
+
+        def _ratio(numerator: float, denominator: float) -> Optional[float]:
+            if denominator == 0:
+                return None
+            return numerator / denominator
+
+        comparison: Dict[str, Dict[str, Optional[float]]] = {}
+        for section in ("warmup", "hot", "cold"):
+            hot_metrics = hot_summary.get(section, {})
+            avl_metrics = avl_fast_summary.get(section, {})
+
+            hot_rounds = float(hot_metrics.get("avg_rounds", 0.0))
+            avl_rounds = float(avl_metrics.get("avg_rounds", 0.0))
+            hot_bw = float(hot_metrics.get("avg_bandwidth_bytes_total", 0.0))
+            avl_bw = float(avl_metrics.get("avg_bandwidth_bytes_total", 0.0))
+
+            comparison[section] = {
+                "hot_avg_rounds": hot_rounds,
+                "avl_fast_search_avg_rounds": avl_rounds,
+                "delta_avg_rounds_hot_minus_avl_fast_search": hot_rounds - avl_rounds,
+                "ratio_avg_rounds_hot_over_avl_fast_search": _ratio(hot_rounds, avl_rounds),
+                "hot_avg_bandwidth_bytes_total": hot_bw,
+                "avl_fast_search_avg_bandwidth_bytes_total": avl_bw,
+                "delta_avg_bandwidth_hot_minus_avl_fast_search": hot_bw - avl_bw,
+                "ratio_avg_bandwidth_hot_over_avl_fast_search": _ratio(hot_bw, avl_bw),
+            }
+
+        return comparison
+
+    @staticmethod
     def run(args: argparse.Namespace) -> Dict[str, Any]:
         """Run benchmark and return full stats payload."""
         if args.insert_count <= 1:
@@ -458,6 +604,7 @@ class AVLOmapHotNodesBenchmarkMain:
         for key in keys:
             omap.insert(key=key, value=payloads[key])
 
+        workload_rng_state = rng.getstate()
         bench = AVLOmapHotNodesBenchmark(omap=omap)
         benchmark_result = bench.benchmark_random_hotset_workload(
             hotset_keys=hotset_keys,
@@ -470,6 +617,21 @@ class AVLOmapHotNodesBenchmarkMain:
             strict_correctness=True,
         )
         benchmark_summary = benchmark_result["summary"]
+        baseline_rng = random.Random()
+        baseline_rng.setstate(workload_rng_state)
+        avl_fast_baseline = AVLOmapHotNodesBenchmarkMain._benchmark_avl_fast_search_workload(
+            args=args,
+            keys=keys,
+            payloads=payloads,
+            hotset_keys=hotset_keys,
+            coldset_keys=coldset_keys,
+            rng=baseline_rng,
+            bench=bench,
+        )
+        comparison_summary = AVLOmapHotNodesBenchmarkMain._build_summary_comparison(
+            hot_summary=benchmark_summary,
+            avl_fast_summary=avl_fast_baseline["summary"],
+        )
         cache_aggregate = bench.get_cache_aggregate(top_n=10)
 
         return {
@@ -495,11 +657,14 @@ class AVLOmapHotNodesBenchmarkMain:
             # "coldset_keys": coldset_keys,
             "benchmark": {
                 "summary": benchmark_summary,
+                "avl_fast_search_summary": avl_fast_baseline["summary"],
+                "comparison_hot_search_vs_avl_fast_search": comparison_summary,
             },
             "hot_cache_stats": omap.get_hot_cache_stats(),
             "cache_aggregate": cache_aggregate,
             "operation_observability": omap.get_operation_observability(),
             "client_observability": omap.get_client_observability(),
+            "avl_fast_search_client_observability": avl_fast_baseline["client_observability"],
         }
 
 
