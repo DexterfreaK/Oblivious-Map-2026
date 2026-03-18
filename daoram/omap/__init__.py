@@ -5,5 +5,6 @@ from .avl_omap_hot_benchmark import AVLOmapHotNodesBenchmark
 from .avl_omap_voram import AVLOmapVoram
 from .bplus_omap import BPlusOmap
 from .bplus_omap_cache import BPlusOmapCached
+from .bplus_omap_hot import BPlusOmapHotNodesClient
 from .group_omap import GroupOmap
 from .oram_ost_omap import OramOstOmap

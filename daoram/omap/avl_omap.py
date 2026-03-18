@@ -784,7 +784,6 @@ class AVLOmap(ObliviousSearchTree):
 
         current = self._local.get(current_key)
         while current.key != key:
-            num_retrieved_nodes += 1
             go_right = current.key < key
             next_key = current.value.r_key if go_right else current.value.l_key
 
@@ -810,6 +809,7 @@ class AVLOmap(ObliviousSearchTree):
             # Get next node and update old_child_path.
             next_leaf = current.value.r_leaf if go_right else current.value.l_leaf
             self._move_node_to_local_without_eviction(key=next_key, leaf=next_leaf, parent_key=current_key)
+            num_retrieved_nodes += 1
             old_child_path = next_leaf
             self._local.remove(current_key)
             current_key = next_key
@@ -827,8 +827,10 @@ class AVLOmap(ObliviousSearchTree):
         self._local.clear()
         self._client.add_write_path(label=self._name, data=self._evict_stash(leaves=[old_child_path]))
         self._client.execute()
-
-        self._perform_dummy_operation(num_round=self._max_height)
+        
+        self._max_height = math.ceil(math.log(self._num_data, 2))
+        if num_retrieved_nodes < self._max_height:
+            self._perform_dummy_operation(num_round=self._max_height - num_retrieved_nodes)
         return search_value
 
     def delete(self, key: Any) -> Any:

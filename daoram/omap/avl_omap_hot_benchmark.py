@@ -345,6 +345,55 @@ class AVLOmapHotNodesBenchmark:
             },
         }
 
+    def benchmark_query_plan(
+        self,
+        warmup_keys: List[Any],
+        query_plan: List[Dict[str, Any]],
+        expected_values: Dict[Any, Any],
+        strict_correctness: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Benchmark a precomputed workload plan so multiple implementations can be compared fairly.
+
+        :param warmup_keys: Warmup key sequence (always treated as warmup reads).
+        :param query_plan: Query entries with fields: {"label": "hot"|"cold", "key": Any}.
+        :param expected_values: Expected key->value map for correctness checks.
+        :param strict_correctness: Raise on any mismatch if True.
+        """
+        warmup_trials: List[Dict[str, Any]] = []
+        for key in warmup_keys:
+            trial = self._measure_search_once(key=key, label="warmup", expected_value=expected_values[key])
+            warmup_trials.append(trial)
+            if strict_correctness and not trial["correct"]:
+                raise AssertionError(f"Warmup correctness failure for key={key}.")
+
+        hot_trials: List[Dict[str, Any]] = []
+        cold_trials: List[Dict[str, Any]] = []
+        for entry in query_plan:
+            label = entry["label"]
+            key = entry["key"]
+            trial = self._measure_search_once(key=key, label=label, expected_value=expected_values[key])
+            if strict_correctness and not trial["correct"]:
+                raise AssertionError(f"Benchmark correctness failure for key={key}, label={label}.")
+
+            if label == "hot":
+                hot_trials.append(trial)
+            elif label == "cold":
+                cold_trials.append(trial)
+            else:
+                raise ValueError(f"Unsupported query label {label!r}. Expected 'hot' or 'cold'.")
+
+        return {
+            "warmup_trials": warmup_trials,
+            "hot_trials": hot_trials,
+            "cold_trials": cold_trials,
+            "summary": {
+                "warmup": self._summarize_trials(warmup_trials),
+                "hot": self._summarize_trials(hot_trials),
+                "cold": self._summarize_trials(cold_trials),
+            },
+        }
+
 
 def _build_payload_map(keys: List[int], payload_size: int, rng: random.Random) -> Dict[int, bytes]:
     """Generate deterministic random payloads for inserted key-value pairs."""
@@ -365,15 +414,73 @@ class AVLOmapHotNodesBenchmarkMain:
         parser.add_argument("--seed", type=int, default=42, help="Random seed for hotset/payload/query generation.")
         parser.add_argument(
             "--hotset-mode",
-            choices=("random", "range"),
+            choices=(
+                "random",
+                "range",
+                "multi_range",
+                "moving_range",
+                "expanding_range",
+                "contracting_range",
+                "nested_ranges",
+                "periodic_ranges",
+                "boundary_hotspot",
+            ),
             default="random",
-            help="How to choose hotset keys: random sample or contiguous range.",
+            help="Hotset workload mode.",
         )
         parser.add_argument(
             "--hotset-range-start",
             type=int,
             default=0,
-            help="Start index for range hotset mode; ignored for random mode.",
+            help="Start index for range-derived hotset modes (when applicable).",
+        )
+        parser.add_argument(
+            "--hotset-width",
+            type=int,
+            default=None,
+            help="Optional explicit hot range width; defaults to rounded hotset fraction size.",
+        )
+        parser.add_argument(
+            "--num-hot-ranges",
+            type=int,
+            default=3,
+            help="Number of ranges for multi/periodic modes.",
+        )
+        parser.add_argument(
+            "--temporal-window",
+            type=int,
+            default=32,
+            help="Queries per phase before moving/periodic/expand/contract mode updates hotspot.",
+        )
+        parser.add_argument(
+            "--range-step",
+            type=int,
+            default=0,
+            help="Range shift step for moving mode; defaults to hotset width when unset/0.",
+        )
+        parser.add_argument(
+            "--nested-inner-fraction",
+            type=float,
+            default=0.2,
+            help="Inner hotspot width as a fraction of outer hotspot width for nested mode.",
+        )
+        parser.add_argument(
+            "--nested-inner-hot-traffic",
+            type=float,
+            default=0.6,
+            help="Within hot traffic, probability of picking the inner nested range.",
+        )
+        parser.add_argument(
+            "--boundary-index",
+            type=int,
+            default=None,
+            help="Boundary center index for boundary_hotspot mode (default: insert_count // 2).",
+        )
+        parser.add_argument(
+            "--boundary-width",
+            type=int,
+            default=None,
+            help="Boundary hotspot width around boundary-index; defaults to hotset width.",
         )
         parser.add_argument(
             "--hotset-fraction",
@@ -394,7 +501,7 @@ class AVLOmapHotNodesBenchmarkMain:
         parser.add_argument(
             "--search-padding",
             action="store_true",
-            default=False,
+            default=True,
             help="Enable padded search rounds (oblivious-style).",
         )
         parser.add_argument(
@@ -404,6 +511,312 @@ class AVLOmapHotNodesBenchmarkMain:
             help="When --search-padding is on, add one extra dummy round per search.",
         )
         return parser
+
+    @staticmethod
+    def _range_keys(start: int, width: int, insert_count: int) -> List[int]:
+        """Return a valid contiguous range inside [0, insert_count)."""
+        if insert_count <= 0:
+            return []
+        width = max(1, min(width, insert_count))
+        max_start = max(0, insert_count - width)
+        start = max(0, min(start, max_start))
+        return list(range(start, start + width))
+
+    @staticmethod
+    def _build_hotset_mode_strategy(
+        args: argparse.Namespace,
+        keys: List[int],
+        rng: random.Random,
+        hot_count: int,
+    ) -> Dict[str, Any]:
+        """
+        Build a mode-specific hotspot strategy.
+
+        Returns:
+          - hotset_at(step): List[int]
+          - sample_hot_key(step, rng): int
+          - metadata: mode-specific details
+        """
+        insert_count = len(keys)
+        explicit_width = args.hotset_width
+        target_hot_size = hot_count if explicit_width is None else explicit_width
+        target_hot_size = max(1, min(target_hot_size, insert_count - 1))
+        temporal_window = max(1, args.temporal_window)
+
+        base_width = target_hot_size
+        max_base_start = max(0, insert_count - base_width)
+        base_start = max(0, min(args.hotset_range_start, max_base_start))
+        mode = args.hotset_mode
+
+        def _build_multi_ranges(width: int, num_ranges: int, start_offset: int = 0) -> List[List[int]]:
+            num_ranges = max(1, min(num_ranges, width))
+            max_start = max(0, insert_count - width)
+            num_ranges = min(num_ranges, max_start + 1)
+            if num_ranges == 1:
+                starts = [max(0, min(start_offset, max_start))]
+            else:
+                stride = max(1, (max_start + 1) // num_ranges)
+                raw_starts = [(start_offset + idx * stride) % (max_start + 1) for idx in range(num_ranges)]
+                # Preserve order and remove duplicates when keyspace is tight.
+                starts = list(dict.fromkeys(raw_starts))
+                while len(starts) < num_ranges:
+                    starts.append((starts[-1] + 1) % (max_start + 1))
+                    starts = list(dict.fromkeys(starts))
+            per_width = max(1, width // max(1, len(starts)))
+            return [AVLOmapHotNodesBenchmarkMain._range_keys(s, per_width, insert_count) for s in starts]
+
+        def _flatten_ranges_to_target(ranges: List[List[int]], target_size: int) -> List[int]:
+            ordered: List[int] = []
+            seen = set()
+            for group in ranges:
+                for key in group:
+                    if key not in seen:
+                        seen.add(key)
+                        ordered.append(key)
+            if len(ordered) < target_size:
+                for key in keys:
+                    if key not in seen:
+                        ordered.append(key)
+                        seen.add(key)
+                    if len(ordered) >= target_size:
+                        break
+            return sorted(ordered[:target_size])
+
+        if mode == "random":
+            hotset = sorted(rng.sample(keys, target_hot_size))
+
+            def hotset_at(_step: int) -> List[int]:
+                return hotset
+
+            def sample_hot_key(_step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset)
+
+            metadata = {"mode": mode}
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "range":
+            hotset = AVLOmapHotNodesBenchmarkMain._range_keys(base_start, base_width, insert_count)
+
+            def hotset_at(_step: int) -> List[int]:
+                return hotset
+
+            def sample_hot_key(_step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset)
+
+            metadata = {"mode": mode, "range_start": hotset[0], "range_end_exclusive": hotset[-1] + 1}
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "multi_range":
+            ranges = _build_multi_ranges(width=base_width, num_ranges=max(2, args.num_hot_ranges), start_offset=base_start)
+            hotset = _flatten_ranges_to_target(ranges=ranges, target_size=base_width)
+
+            def hotset_at(_step: int) -> List[int]:
+                return hotset
+
+            def sample_hot_key(_step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset)
+
+            metadata = {
+                "mode": mode,
+                "ranges": [(group[0], group[-1] + 1) for group in ranges if group],
+                "num_hot_ranges": len(ranges),
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "nested_ranges":
+            outer = AVLOmapHotNodesBenchmarkMain._range_keys(base_start, base_width, insert_count)
+            inner_width = max(1, int(round(base_width * args.nested_inner_fraction)))
+            inner_width = min(inner_width, len(outer))
+            inner_start = outer[0] + max(0, (len(outer) - inner_width) // 2)
+            inner = AVLOmapHotNodesBenchmarkMain._range_keys(inner_start, inner_width, insert_count)
+            inner_set = set(inner)
+            outer_only = [key for key in outer if key not in inner_set]
+
+            def hotset_at(_step: int) -> List[int]:
+                return outer
+
+            def sample_hot_key(_step: int, local_rng: random.Random) -> int:
+                if inner and local_rng.random() < args.nested_inner_hot_traffic:
+                    return local_rng.choice(inner)
+                if outer_only:
+                    return local_rng.choice(outer_only)
+                return local_rng.choice(outer)
+
+            metadata = {
+                "mode": mode,
+                "outer_range": (outer[0], outer[-1] + 1),
+                "inner_range": (inner[0], inner[-1] + 1) if inner else None,
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "boundary_hotspot":
+            center = (insert_count // 2) if args.boundary_index is None else args.boundary_index
+            boundary_width = base_width if args.boundary_width is None else args.boundary_width
+            boundary_width = max(1, min(boundary_width, insert_count - 1))
+            start = center - (boundary_width // 2)
+            hotset = AVLOmapHotNodesBenchmarkMain._range_keys(start, boundary_width, insert_count)
+
+            def hotset_at(_step: int) -> List[int]:
+                return hotset
+
+            def sample_hot_key(_step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset)
+
+            metadata = {
+                "mode": mode,
+                "boundary_center": center,
+                "boundary_range": (hotset[0], hotset[-1] + 1),
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        move_step = args.range_step if args.range_step > 0 else base_width
+        max_start = max(0, insert_count - base_width)
+
+        if mode == "moving_range":
+
+            def hotset_at(step: int) -> List[int]:
+                phase = step // temporal_window
+                start = (base_start + phase * move_step) % (max_start + 1)
+                return AVLOmapHotNodesBenchmarkMain._range_keys(start, base_width, insert_count)
+
+            def sample_hot_key(step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset_at(step))
+
+            metadata = {"mode": mode, "range_step": move_step, "temporal_window": temporal_window}
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "periodic_ranges":
+            periodic_ranges = _build_multi_ranges(
+                width=base_width,
+                num_ranges=max(2, args.num_hot_ranges),
+                start_offset=base_start,
+            )
+            if not periodic_ranges:
+                periodic_ranges = [AVLOmapHotNodesBenchmarkMain._range_keys(base_start, base_width, insert_count)]
+
+            def hotset_at(step: int) -> List[int]:
+                phase = step // temporal_window
+                return periodic_ranges[phase % len(periodic_ranges)]
+
+            def sample_hot_key(step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset_at(step))
+
+            metadata = {
+                "mode": mode,
+                "ranges": [(group[0], group[-1] + 1) for group in periodic_ranges if group],
+                "temporal_window": temporal_window,
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        # expanding_range / contracting_range
+        min_width = max(1, base_width // 4)
+        width_step = args.range_step if args.range_step > 0 else max(1, base_width // 4)
+
+        if mode == "expanding_range":
+
+            def hotset_at(step: int) -> List[int]:
+                phase = step // temporal_window
+                width = min(base_width, min_width + phase * width_step)
+                width = max(1, min(width, insert_count - 1))
+                start = max(0, min(base_start, insert_count - width))
+                return AVLOmapHotNodesBenchmarkMain._range_keys(start, width, insert_count)
+
+            def sample_hot_key(step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset_at(step))
+
+            metadata = {
+                "mode": mode,
+                "min_width": min_width,
+                "max_width": base_width,
+                "width_step": width_step,
+                "temporal_window": temporal_window,
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        if mode == "contracting_range":
+
+            def hotset_at(step: int) -> List[int]:
+                phase = step // temporal_window
+                width = max(min_width, base_width - phase * width_step)
+                width = max(1, min(width, insert_count - 1))
+                start = max(0, min(base_start, insert_count - width))
+                return AVLOmapHotNodesBenchmarkMain._range_keys(start, width, insert_count)
+
+            def sample_hot_key(step: int, local_rng: random.Random) -> int:
+                return local_rng.choice(hotset_at(step))
+
+            metadata = {
+                "mode": mode,
+                "min_width": min_width,
+                "start_width": base_width,
+                "width_step": width_step,
+                "temporal_window": temporal_window,
+            }
+            return {"hotset_at": hotset_at, "sample_hot_key": sample_hot_key, "metadata": metadata}
+
+        raise ValueError(f"Unsupported hotset mode {mode!r}.")
+
+    @staticmethod
+    def _build_workload_plan(
+        args: argparse.Namespace,
+        keys: List[int],
+        rng: random.Random,
+        hot_count: int,
+    ) -> Dict[str, Any]:
+        """Build warmup and benchmark query plans for the selected hotset mode."""
+        strategy = AVLOmapHotNodesBenchmarkMain._build_hotset_mode_strategy(
+            args=args,
+            keys=keys,
+            rng=rng,
+            hot_count=hot_count,
+        )
+        hotset_at = strategy["hotset_at"]
+        sample_hot_key = strategy["sample_hot_key"]
+
+        warmup_keys: List[int] = []
+        query_plan: List[Dict[str, Any]] = []
+        observed_hotset_sizes: List[int] = []
+
+        for step in range(args.warmup_accesses):
+            current_hotset = hotset_at(step)
+            observed_hotset_sizes.append(len(current_hotset))
+            warmup_keys.append(sample_hot_key(step, rng))
+
+        for query_index in range(args.num_queries):
+            step = args.warmup_accesses + query_index
+            current_hotset = hotset_at(step)
+            current_hotset_set = set(current_hotset)
+            observed_hotset_sizes.append(len(current_hotset))
+
+            use_hot = rng.random() < args.hot_query_probability
+            if use_hot:
+                key = sample_hot_key(step, rng)
+                label = "hot"
+            else:
+                cold_candidates = [key for key in keys if key not in current_hotset_set]
+                if not cold_candidates:
+                    key = sample_hot_key(step, rng)
+                    label = "hot"
+                else:
+                    key = rng.choice(cold_candidates)
+                    label = "cold"
+
+            query_plan.append({"label": label, "key": key})
+
+        initial_hotset = hotset_at(0) if keys else []
+        hotset_size_min = min(observed_hotset_sizes) if observed_hotset_sizes else 0
+        hotset_size_max = max(observed_hotset_sizes) if observed_hotset_sizes else 0
+        hotset_size_avg = statistics.mean(observed_hotset_sizes) if observed_hotset_sizes else 0.0
+
+        return {
+            "warmup_keys": warmup_keys,
+            "query_plan": query_plan,
+            "initial_hotset_keys": list(initial_hotset),
+            "mode_metadata": strategy["metadata"],
+            "hotset_size_min": hotset_size_min,
+            "hotset_size_max": hotset_size_max,
+            "hotset_size_avg": hotset_size_avg,
+        }
 
     @staticmethod
     def _snapshot_client(client: InteractLocalServer) -> Dict[str, int]:
@@ -452,12 +865,11 @@ class AVLOmapHotNodesBenchmarkMain:
         args: argparse.Namespace,
         keys: List[int],
         payloads: Dict[int, bytes],
-        hotset_keys: List[int],
-        coldset_keys: List[int],
-        rng: random.Random,
+        warmup_keys: List[int],
+        query_plan: List[Dict[str, Any]],
         bench: AVLOmapHotNodesBenchmark,
     ) -> Dict[str, Any]:
-        """Run the exact same warmup/query workload on plain AVLOmap.fast_search."""
+        """Run a precomputed warmup/query workload on plain AVLOmap.fast_search."""
         client = InteractLocalServer()
         omap = AVLOmap(
             num_data=args.num_data,
@@ -471,8 +883,7 @@ class AVLOmapHotNodesBenchmarkMain:
             omap.insert(key=key, value=payloads[key])
 
         warmup_trials: List[Dict[str, Any]] = []
-        for _ in range(args.warmup_accesses):
-            key = rng.choice(hotset_keys)
+        for key in warmup_keys:
             trial = AVLOmapHotNodesBenchmarkMain._measure_avl_fast_search_once(
                 omap=omap,
                 client=client,
@@ -486,10 +897,9 @@ class AVLOmapHotNodesBenchmarkMain:
 
         hot_trials: List[Dict[str, Any]] = []
         cold_trials: List[Dict[str, Any]] = []
-        for _ in range(args.num_queries):
-            use_hot = rng.random() < args.hot_query_probability
-            key = rng.choice(hotset_keys) if use_hot else rng.choice(coldset_keys)
-            label = "hot" if use_hot else "cold"
+        for entry in query_plan:
+            key = entry["key"]
+            label = entry["label"]
 
             trial = AVLOmapHotNodesBenchmarkMain._measure_avl_fast_search_once(
                 omap=omap,
@@ -499,12 +909,14 @@ class AVLOmapHotNodesBenchmarkMain:
                 expected_value=payloads[key],
             )
             if not trial["correct"]:
-                raise AssertionError(f"AVLOmap.fast_search benchmark correctness failure for key={key}.")
+                raise AssertionError(f"AVLOmap.fast_search benchmark correctness failure for key={key}, label={label}.")
 
-            if use_hot:
+            if label == "hot":
                 hot_trials.append(trial)
-            else:
+            elif label == "cold":
                 cold_trials.append(trial)
+            else:
+                raise ValueError(f"Unsupported query label {label!r}. Expected 'hot' or 'cold'.")
 
         return {
             "summary": {
@@ -541,11 +953,11 @@ class AVLOmapHotNodesBenchmarkMain:
                 "hot_avg_rounds": hot_rounds,
                 "avl_fast_search_avg_rounds": avl_rounds,
                 "delta_avg_rounds_hot_minus_avl_fast_search": hot_rounds - avl_rounds,
-                "ratio_avg_rounds_hot_over_avl_fast_search": _ratio(hot_rounds, avl_rounds),
+                "1/ratio_avg_rounds_hot_over_avl_fast_search": _ratio(avl_rounds,hot_rounds),
                 "hot_avg_bandwidth_bytes_total": hot_bw,
                 "avl_fast_search_avg_bandwidth_bytes_total": avl_bw,
                 "delta_avg_bandwidth_hot_minus_avl_fast_search": hot_bw - avl_bw,
-                "ratio_avg_bandwidth_hot_over_avl_fast_search": _ratio(hot_bw, avl_bw),
+                "1/ratio_avg_bandwidth_hot_over_avl_fast_search": _ratio(avl_bw, hot_bw),
             }
 
         return comparison
@@ -553,6 +965,21 @@ class AVLOmapHotNodesBenchmarkMain:
     @staticmethod
     def run(args: argparse.Namespace) -> Dict[str, Any]:
         """Run benchmark and return full stats payload."""
+        # Backward-compatible defaults for callers constructing Namespace manually.
+        default_fields = {
+            "hotset_width": None,
+            "num_hot_ranges": 3,
+            "temporal_window": 32,
+            "range_step": 0,
+            "nested_inner_fraction": 0.2,
+            "nested_inner_hot_traffic": 0.6,
+            "boundary_index": None,
+            "boundary_width": None,
+        }
+        for field, value in default_fields.items():
+            if not hasattr(args, field):
+                setattr(args, field, value)
+
         if args.insert_count <= 1:
             raise ValueError("--insert-count must be > 1.")
         if args.insert_count > args.num_data:
@@ -567,24 +994,46 @@ class AVLOmapHotNodesBenchmarkMain:
             raise ValueError("--payload-size must be non-negative.")
         if args.hotset_range_start < 0:
             raise ValueError("--hotset-range-start must be non-negative.")
+        if args.hotset_width is not None and args.hotset_width <= 0:
+            raise ValueError("--hotset-width must be positive when provided.")
+        if args.num_hot_ranges <= 0:
+            raise ValueError("--num-hot-ranges must be positive.")
+        if args.temporal_window <= 0:
+            raise ValueError("--temporal-window must be positive.")
+        if args.range_step < 0:
+            raise ValueError("--range-step must be non-negative.")
+        if args.nested_inner_fraction <= 0.0 or args.nested_inner_fraction > 1.0:
+            raise ValueError("--nested-inner-fraction must be in (0, 1].")
+        if args.nested_inner_hot_traffic < 0.0 or args.nested_inner_hot_traffic > 1.0:
+            raise ValueError("--nested-inner-hot-traffic must be in [0, 1].")
+        if args.boundary_index is not None and (args.boundary_index < 0 or args.boundary_index >= args.insert_count):
+            raise ValueError("--boundary-index must be in [0, insert_count).")
+        if args.boundary_width is not None and args.boundary_width <= 0:
+            raise ValueError("--boundary-width must be positive when provided.")
 
         rng = random.Random(args.seed)
 
         keys = list(range(args.insert_count))
         hot_count = max(1, int(round(args.insert_count * args.hotset_fraction)))
         hot_count = min(hot_count, args.insert_count - 1)
+        effective_hot_width = hot_count if args.hotset_width is None else min(max(1, args.hotset_width), args.insert_count - 1)
         if args.hotset_mode == "range":
-            hotset_end = args.hotset_range_start + hot_count
+            hotset_end = args.hotset_range_start + effective_hot_width
             if hotset_end > args.insert_count:
                 raise ValueError(
                     "--hotset-range-start + hotset_size exceeds --insert-count; "
                     "pick a smaller start or hotset-fraction."
                 )
-            hotset_keys = list(range(args.hotset_range_start, hotset_end))
-        else:
-            hotset_keys = sorted(rng.sample(keys, hot_count))
-        hotset_key_set = set(hotset_keys)
-        coldset_keys = [key for key in keys if key not in hotset_key_set]
+        workload_plan = AVLOmapHotNodesBenchmarkMain._build_workload_plan(
+            args=args,
+            keys=keys,
+            rng=rng,
+            hot_count=hot_count,
+        )
+        hotset_keys = workload_plan["initial_hotset_keys"]
+        coldset_keys = [key for key in keys if key not in set(hotset_keys)]
+        warmup_keys = workload_plan["warmup_keys"]
+        query_plan = workload_plan["query_plan"]
 
         payloads = _build_payload_map(keys=keys, payload_size=args.payload_size, rng=rng)
 
@@ -604,28 +1053,20 @@ class AVLOmapHotNodesBenchmarkMain:
         for key in keys:
             omap.insert(key=key, value=payloads[key])
 
-        workload_rng_state = rng.getstate()
         bench = AVLOmapHotNodesBenchmark(omap=omap)
-        benchmark_result = bench.benchmark_random_hotset_workload(
-            hotset_keys=hotset_keys,
-            coldset_keys=coldset_keys,
+        benchmark_result = bench.benchmark_query_plan(
+            warmup_keys=warmup_keys,
+            query_plan=query_plan,
             expected_values=payloads,
-            rng=rng,
-            num_queries=args.num_queries,
-            hot_query_probability=args.hot_query_probability,
-            warmup_accesses=args.warmup_accesses,
             strict_correctness=True,
         )
         benchmark_summary = benchmark_result["summary"]
-        baseline_rng = random.Random()
-        baseline_rng.setstate(workload_rng_state)
         avl_fast_baseline = AVLOmapHotNodesBenchmarkMain._benchmark_avl_fast_search_workload(
             args=args,
             keys=keys,
             payloads=payloads,
-            hotset_keys=hotset_keys,
-            coldset_keys=coldset_keys,
-            rng=baseline_rng,
+            warmup_keys=warmup_keys,
+            query_plan=query_plan,
             bench=bench,
         )
         comparison_summary = AVLOmapHotNodesBenchmarkMain._build_summary_comparison(
@@ -642,9 +1083,20 @@ class AVLOmapHotNodesBenchmarkMain:
                 "seed": args.seed,
                 "hotset_mode": args.hotset_mode,
                 "hotset_range_start": args.hotset_range_start,
+                "hotset_width": args.hotset_width,
+                "num_hot_ranges": args.num_hot_ranges,
+                "temporal_window": args.temporal_window,
+                "range_step": args.range_step,
+                "nested_inner_fraction": args.nested_inner_fraction,
+                "nested_inner_hot_traffic": args.nested_inner_hot_traffic,
+                "boundary_index": args.boundary_index,
+                "boundary_width": args.boundary_width,
                 "hotset_fraction": args.hotset_fraction,
                 "hotset_size": len(hotset_keys),
                 "coldset_size": len(coldset_keys),
+                "hotset_size_min_over_time": workload_plan["hotset_size_min"],
+                "hotset_size_max_over_time": workload_plan["hotset_size_max"],
+                "hotset_size_avg_over_time": workload_plan["hotset_size_avg"],
                 "hot_query_probability": args.hot_query_probability,
                 "warmup_accesses": args.warmup_accesses,
                 "num_queries": args.num_queries,
@@ -652,6 +1104,7 @@ class AVLOmapHotNodesBenchmarkMain:
                 "hot_threshold": args.hot_threshold,
                 "search_padding": args.search_padding,
                 "always_dummy_after_search": args.always_dummy_after_search,
+                "mode_metadata": workload_plan["mode_metadata"],
             },
             # "hotset_keys": hotset_keys,
             # "coldset_keys": coldset_keys,
@@ -673,7 +1126,7 @@ def main() -> None:
     parser = AVLOmapHotNodesBenchmarkMain.build_parser()
     args = parser.parse_args()
     output = AVLOmapHotNodesBenchmarkMain.run(args=args)
-    with open("output.json", "w") as f:
+    with open("output_2.json", "w") as f:
         json.dump(output, f, indent=2, sort_keys=True, default=str)
     # print(json.dumps(output, indent=2, sort_keys=True, default=str))
 
