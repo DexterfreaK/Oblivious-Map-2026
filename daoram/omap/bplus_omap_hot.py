@@ -59,17 +59,24 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         encryptor: Encryptor = None,
         hot_nodes_client_size: int = 64,
         hot_access_threshold: int = 2,
-        default_sensitivity: Any = 0,
+        default_secret_user_id: Any = 0,
+        max_secret_user_id_value: Any = None,
+        default_sensitivity: Any = None,
         max_sensitivity_value: Any = None,
     ):
-        self._default_sensitivity = copy.deepcopy(default_sensitivity)
-        self._max_sensitivity_value = (
-            copy.deepcopy(default_sensitivity)
-            if max_sensitivity_value is None
-            else copy.deepcopy(max_sensitivity_value)
+        if default_sensitivity is not None:
+            default_secret_user_id = default_sensitivity
+        if max_sensitivity_value is not None:
+            max_secret_user_id_value = max_sensitivity_value
+
+        self._default_secret_user_id = copy.deepcopy(default_secret_user_id)
+        self._max_secret_user_id_value = (
+            copy.deepcopy(default_secret_user_id)
+            if max_secret_user_id_value is None
+            else copy.deepcopy(max_secret_user_id_value)
         )
-        self._max_sensitivity_pickle_size = len(pickle.dumps(self._max_sensitivity_value))
-        self._validate_sensitivity_size(self._default_sensitivity)
+        self._max_secret_user_id_pickle_size = len(pickle.dumps(self._max_secret_user_id_value))
+        self._validate_secret_user_id_size(self._default_secret_user_id)
 
         super().__init__(
             order=order,
@@ -88,7 +95,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._hot_access_threshold = max(0, hot_access_threshold)
         self._hot_nodes_client: "OrderedDict[Any, Data]" = OrderedDict()
         self._stash_size += self._hot_nodes_client_size
-        self._sensitivity_version = 0
+        self._secret_user_id_version = 0
 
         self.hot_cache_hits = 0
         self.hot_cache_misses = 0
@@ -109,35 +116,35 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             "evictions": self.hot_cache_evictions,
         }
 
-    def _validate_sensitivity_size(self, sensitivity: Any) -> None:
-        """Reject sensitivities that would exceed the configured block budget."""
-        if len(pickle.dumps(sensitivity)) > self._max_sensitivity_pickle_size:
+    def _validate_secret_user_id_size(self, secret_user_id: Any) -> None:
+        """Reject secret user ids that would exceed the configured block budget."""
+        if len(pickle.dumps(secret_user_id)) > self._max_secret_user_id_pickle_size:
             raise ValueError(
-                "Sensitivity value exceeds the configured sizing bound. "
-                "Pass a larger max_sensitivity_value when constructing the OMAP."
+                "secret_user_id value exceeds the configured sizing bound. "
+                "Pass a larger max_secret_user_id_value when constructing the OMAP."
             )
 
     def _make_metadata(
         self,
         access_count: int = 0,
-        sensitivity: Any = None,
+        secret_user_id: Any = None,
         pinned_leaf: Optional[int] = None,
-        sensitivity_version: int = 0,
-        lazy_sensitivity: Any = None,
+        secret_user_id_version: int = 0,
+        lazy_secret_user_id: Any = None,
         lazy_height: int = 0,
         lazy_version: int = -1,
     ) -> Dict[str, Any]:
         """Create a metadata block for a node."""
-        sensitivity_value = self._default_sensitivity if sensitivity is None else sensitivity
-        self._validate_sensitivity_size(sensitivity_value)
-        if lazy_sensitivity is not None:
-            self._validate_sensitivity_size(lazy_sensitivity)
+        secret_user_id_value = self._default_secret_user_id if secret_user_id is None else secret_user_id
+        self._validate_secret_user_id_size(secret_user_id_value)
+        if lazy_secret_user_id is not None:
+            self._validate_secret_user_id_size(lazy_secret_user_id)
         return {
             "access_count": min(int(access_count), self._ACCESS_COUNT_CAP),
-            "sensitivity": copy.deepcopy(sensitivity_value),
+            "secret_user_id": copy.deepcopy(secret_user_id_value),
             "pinned_leaf": pinned_leaf,
-            "sensitivity_version": int(sensitivity_version),
-            "lazy_sensitivity": copy.deepcopy(lazy_sensitivity),
+            "secret_user_id_version": int(secret_user_id_version),
+            "lazy_secret_user_id": copy.deepcopy(lazy_secret_user_id),
             "lazy_height": max(0, int(lazy_height)),
             "lazy_version": int(lazy_version),
         }
@@ -151,45 +158,51 @@ class BPlusOmapHotNodesClient(BPlusOmap):
 
         if "access_count" not in metadata:
             metadata["access_count"] = 0
-        if "sensitivity" not in metadata:
-            metadata["sensitivity"] = copy.deepcopy(self._default_sensitivity)
+        if "secret_user_id" not in metadata and "sensitivity" in metadata:
+            metadata["secret_user_id"] = metadata.pop("sensitivity")
+        if "secret_user_id" not in metadata:
+            metadata["secret_user_id"] = copy.deepcopy(self._default_secret_user_id)
         if "pinned_leaf" not in metadata:
             metadata["pinned_leaf"] = None
-        if "sensitivity_version" not in metadata:
-            metadata["sensitivity_version"] = 0
-        if "lazy_sensitivity" not in metadata:
-            metadata["lazy_sensitivity"] = None
+        if "secret_user_id_version" not in metadata and "sensitivity_version" in metadata:
+            metadata["secret_user_id_version"] = metadata.pop("sensitivity_version")
+        if "secret_user_id_version" not in metadata:
+            metadata["secret_user_id_version"] = 0
+        if "lazy_secret_user_id" not in metadata and "lazy_sensitivity" in metadata:
+            metadata["lazy_secret_user_id"] = metadata.pop("lazy_sensitivity")
+        if "lazy_secret_user_id" not in metadata:
+            metadata["lazy_secret_user_id"] = None
         if "lazy_height" not in metadata:
             metadata["lazy_height"] = 0
         if "lazy_version" not in metadata:
             metadata["lazy_version"] = -1
 
-        self._validate_sensitivity_size(metadata["sensitivity"])
-        if metadata["lazy_sensitivity"] is not None:
-            self._validate_sensitivity_size(metadata["lazy_sensitivity"])
+        self._validate_secret_user_id_size(metadata["secret_user_id"])
+        if metadata["lazy_secret_user_id"] is not None:
+            self._validate_secret_user_id_size(metadata["lazy_secret_user_id"])
         metadata["access_count"] = min(int(metadata["access_count"]), self._ACCESS_COUNT_CAP)
-        metadata["sensitivity_version"] = int(metadata["sensitivity_version"])
+        metadata["secret_user_id_version"] = int(metadata["secret_user_id_version"])
         metadata["lazy_height"] = max(0, int(metadata["lazy_height"]))
         metadata["lazy_version"] = int(metadata["lazy_version"])
         return metadata
 
-    def _next_sensitivity_version(self) -> int:
-        """Return a monotonically increasing version for sensitivity assignments."""
-        self._sensitivity_version += 1
-        return self._sensitivity_version
+    def _next_secret_user_id_version(self) -> int:
+        """Return a monotonically increasing version for secret_user_id assignments."""
+        self._secret_user_id_version += 1
+        return self._secret_user_id_version
 
-    def _apply_sensitivity_value(self, node: Data, sensitivity: Any, version: int) -> None:
-        """Apply a sensitivity value if it is newer than the node's current one."""
+    def _apply_secret_user_id_value(self, node: Data, secret_user_id: Any, version: int) -> None:
+        """Apply a secret_user_id value if it is newer than the node's current one."""
         metadata = self._ensure_node_metadata(node)
-        if version < metadata["sensitivity_version"]:
+        if version < metadata["secret_user_id_version"]:
             return
 
-        self._validate_sensitivity_size(sensitivity)
-        metadata["sensitivity"] = copy.deepcopy(sensitivity)
-        metadata["sensitivity_version"] = int(version)
+        self._validate_secret_user_id_size(secret_user_id)
+        metadata["secret_user_id"] = copy.deepcopy(secret_user_id)
+        metadata["secret_user_id_version"] = int(version)
 
-    def _install_lazy_sensitivity(self, node: Data, sensitivity: Any, height: int, version: int) -> None:
-        """Install or extend a pending lazy sensitivity propagation marker."""
+    def _install_lazy_secret_user_id(self, node: Data, secret_user_id: Any, height: int, version: int) -> None:
+        """Install or extend a pending lazy secret_user_id propagation marker."""
         if height <= 0:
             return
 
@@ -199,54 +212,54 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         if version == metadata["lazy_version"] and height <= metadata["lazy_height"]:
             return
 
-        self._validate_sensitivity_size(sensitivity)
-        metadata["lazy_sensitivity"] = copy.deepcopy(sensitivity)
+        self._validate_secret_user_id_size(secret_user_id)
+        metadata["lazy_secret_user_id"] = copy.deepcopy(secret_user_id)
         metadata["lazy_height"] = int(height)
         metadata["lazy_version"] = int(version)
 
-    def _propagate_lazy_sensitivity_to_child(self, parent: Data, child: Data) -> None:
-        """Propagate pending subtree sensitivity from a parent into a visited child."""
+    def _propagate_lazy_secret_user_id_to_child(self, parent: Data, child: Data) -> None:
+        """Propagate pending subtree secret_user_id from a parent into a visited child."""
         parent_metadata = self._ensure_node_metadata(parent)
-        pending_sensitivity = parent_metadata["lazy_sensitivity"]
+        pending_secret_user_id = parent_metadata["lazy_secret_user_id"]
         pending_height = parent_metadata["lazy_height"]
         pending_version = parent_metadata["lazy_version"]
 
-        if pending_sensitivity is None or pending_height <= 0:
+        if pending_secret_user_id is None or pending_height <= 0:
             return
 
-        self._apply_sensitivity_value(node=child, sensitivity=pending_sensitivity, version=pending_version)
-        self._install_lazy_sensitivity(
+        self._apply_secret_user_id_value(node=child, secret_user_id=pending_secret_user_id, version=pending_version)
+        self._install_lazy_secret_user_id(
             node=child,
-            sensitivity=pending_sensitivity,
+            secret_user_id=pending_secret_user_id,
             height=pending_height - 1,
             version=pending_version,
         )
 
-    def _assign_sensitivity_to_current_subtree(
+    def _assign_secret_user_id_to_current_subtree(
         self,
         subtree_height: int,
-        sensitivity: Any,
+        secret_user_id: Any,
     ) -> None:
-        """Apply sensitivity to the current search path and lazily mark the remaining subtree."""
-        if subtree_height is None and sensitivity is None:
+        """Apply secret_user_id to the current search path and lazily mark the remaining subtree."""
+        if subtree_height is None and secret_user_id is None:
             return
-        if subtree_height is None or sensitivity is None:
-            raise ValueError("subtree_height and sensitivity must be provided together.")
+        if subtree_height is None or secret_user_id is None:
+            raise ValueError("subtree_height and secret_user_id must be provided together.")
         if subtree_height < 1:
             raise ValueError("subtree_height must be at least 1.")
         if subtree_height > len(self._local.path):
             raise ValueError("subtree_height exceeds the current root-to-leaf path length.")
 
-        version = self._next_sensitivity_version()
+        version = self._next_secret_user_id_version()
         start_index = len(self._local.path) - subtree_height
 
         for offset, node_key in enumerate(self._local.path[start_index:]):
             node = self._local.get(node_key)
             remaining_height = subtree_height - 1 - offset
-            self._apply_sensitivity_value(node=node, sensitivity=sensitivity, version=version)
-            self._install_lazy_sensitivity(
+            self._apply_secret_user_id_value(node=node, secret_user_id=secret_user_id, version=version)
+            self._install_lazy_secret_user_id(
                 node=node,
-                sensitivity=sensitivity,
+                secret_user_id=secret_user_id,
                 height=remaining_height,
                 version=version,
             )
@@ -296,14 +309,14 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 break
         return child_index
 
-    def _numeric_sensitivity(self, node: Data) -> float:
-        """Convert sensitivity to a numeric score when possible."""
-        sensitivity = self._ensure_node_metadata(node)["sensitivity"]
-        return float(sensitivity) if isinstance(sensitivity, (int, float)) else 0.0
+    def _numeric_secret_user_id(self, node: Data) -> float:
+        """Convert secret_user_id to a numeric score when possible."""
+        secret_user_id = self._ensure_node_metadata(node)["secret_user_id"]
+        return float(secret_user_id) if isinstance(secret_user_id, (int, float)) else 0.0
 
     def _hot_score(self, node: Data) -> Tuple[int, float]:
         metadata = self._ensure_node_metadata(node)
-        return metadata["access_count"], self._numeric_sensitivity(node)
+        return metadata["access_count"], self._numeric_secret_user_id(node)
 
     def _select_eviction_candidate(self) -> Any:
         """Evict lowest-score node, breaking ties by current cache order."""
@@ -315,6 +328,26 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 victim_key = key
                 victim_score = score
         return victim_key
+
+    def _should_admit_hot_candidate(self, node: Data) -> bool:
+        """Admit a cold candidate only if it beats the weakest cached node."""
+        if self._hot_nodes_client_size == 0:
+            return False
+
+        if node.key in self._hot_nodes_client:
+            return True
+
+        if len(self._hot_nodes_client) < self._hot_nodes_client_size:
+            return True
+
+        victim_key = self._select_eviction_candidate()
+        if victim_key is None:
+            return False
+
+        victim_node = self._hot_nodes_client[victim_key]
+        candidate_score = self._hot_score(node)
+        victim_score = self._hot_score(victim_node)
+        return candidate_score > victim_score
 
     def _check_stash_capacity(self) -> None:
         if len(self._stash) > self._stash_size:
@@ -331,10 +364,10 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         max_leaf = self._leaf_range - 1
         metadata = self._make_metadata(
             access_count=self._ACCESS_COUNT_CAP,
-            sensitivity=self._max_sensitivity_value,
+            secret_user_id=self._max_secret_user_id_value,
             pinned_leaf=max_leaf,
-            sensitivity_version=self._ACCESS_COUNT_CAP,
-            lazy_sensitivity=self._max_sensitivity_value,
+            secret_user_id_version=self._ACCESS_COUNT_CAP,
+            lazy_secret_user_id=self._max_secret_user_id_value,
             lazy_height=self._max_height,
             lazy_version=self._ACCESS_COUNT_CAP,
         )
@@ -411,11 +444,15 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self,
         keys: Any = None,
         values: Any = None,
-        sensitivity: Any = None,
+        secret_user_id: Any = None,
         metadata: Dict[str, Any] = None,
     ) -> Data:
         """Create a new hot-aware B+ node."""
-        node_metadata = copy.deepcopy(metadata) if metadata is not None else self._make_metadata(sensitivity=sensitivity)
+        node_metadata = (
+            copy.deepcopy(metadata)
+            if metadata is not None
+            else self._make_metadata(secret_user_id=secret_user_id)
+        )
         data_block = Data(
             key=self._block_id,
             leaf=self._get_new_leaf(),
@@ -591,7 +628,10 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         if from_oram:
             self._prepare_cold_node(node)
 
-        if metadata["access_count"] > self._hot_access_threshold:
+        if (
+            metadata["access_count"] > self._hot_access_threshold
+            and self._should_admit_hot_candidate(node=node)
+        ):
             leaf_p = self._get_new_leaf()
             metadata["pinned_leaf"] = leaf_p
             node.leaf = leaf_p
@@ -757,7 +797,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=False,
             )
 
-            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
             node = child
             old_leaf = node.leaf
             self._prepare_cold_node(node)
@@ -789,7 +829,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=False,
             )
 
-            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
             self._prepare_cold_node(child)
             self._set_pointer(parent=node, child_index=child_index, node_id=child.key, leaf_p=new_leaf, location=self.ORAM)
             child.leaf = new_leaf
@@ -912,7 +952,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         key: Any,
         value: Any = None,
         subtree_height: int = None,
-        sensitivity: Any = None,
+        secret_user_id: Any = None,
     ) -> Any:
         """Search while keeping the full root-to-leaf path local."""
         evicted_active_keys: Set[Any] = set()
@@ -939,7 +979,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=True,
             )
 
-            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
             self._record_access_and_place_node(
                 node=child,
                 parent=node,
@@ -957,9 +997,9 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                     node.value.values[index] = value
                 break
 
-        self._assign_sensitivity_to_current_subtree(
+        self._assign_secret_user_id_to_current_subtree(
             subtree_height=subtree_height,
-            sensitivity=sensitivity,
+            secret_user_id=secret_user_id,
         )
 
         for local_node in self._local.to_list():
@@ -1013,7 +1053,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=True,
             )
 
-            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
             self._record_access_and_place_node(
                 node=child,
                 parent=node,
@@ -1044,6 +1084,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         key: Any,
         value: Any = None,
         subtree_height: int = None,
+        secret_user_id: Any = None,
         sensitivity: Any = None,
     ) -> Any:
         """Search using the client hot-node cache on internal traversals."""
@@ -1053,12 +1094,17 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         if self._local:
             raise MemoryError("The local storage was not emptied before this operation.")
 
-        if subtree_height is not None or sensitivity is not None:
+        if sensitivity is not None:
+            if secret_user_id is not None and secret_user_id != sensitivity:
+                raise ValueError("secret_user_id and sensitivity aliases disagree.")
+            secret_user_id = sensitivity
+
+        if subtree_height is not None or secret_user_id is not None:
             return self._search_with_buffered_path(
                 key=key,
                 value=value,
                 subtree_height=subtree_height,
-                sensitivity=sensitivity,
+                secret_user_id=secret_user_id,
             )
 
         return self._search_with_immediate_writeback(key=key, value=value)
@@ -1097,9 +1143,13 @@ class BPlusOmapHotNodesClient(BPlusOmap):
 
         return search_value
 
+    def set_secret_user_id(self, key: Any, subtree_height: int, secret_user_id: Any) -> Any:
+        """Traverse to `key` and assign `secret_user_id` to the subtree of the given height."""
+        return self.search(key=key, subtree_height=subtree_height, secret_user_id=secret_user_id)
+
     def set_sensitivity(self, key: Any, subtree_height: int, sensitivity: Any) -> Any:
-        """Traverse to `key` and assign `sensitivity` to the subtree of the given height."""
-        return self.search(key=key, subtree_height=subtree_height, sensitivity=sensitivity)
+        """Backward-compatible alias for set_secret_user_id()."""
+        return self.set_secret_user_id(key=key, subtree_height=subtree_height, secret_user_id=sensitivity)
 
     def _find_path_for_delete(self, key: Any) -> Tuple[Dict[int, Data], List[int]]:
         """Find the delete path under the hot pointer representation."""
@@ -1128,7 +1178,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             )
             child_node = self._local.remove(self._local.root_key)
 
-            self._propagate_lazy_sensitivity_to_child(parent=node, child=child_node)
+            self._propagate_lazy_secret_user_id_to_child(parent=node, child=child_node)
             self._prepare_cold_node(child_node)
             self._set_pointer(parent=node, child_index=child_index, node_id=child_node.key, leaf_p=new_leaf, location=self.ORAM)
             child_node.leaf = new_leaf
@@ -1153,7 +1203,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         )
         sibling = self._local.remove(self._local.root_key)
 
-        self._propagate_lazy_sensitivity_to_child(parent=parent, child=sibling)
+        self._propagate_lazy_secret_user_id_to_child(parent=parent, child=sibling)
         self._prepare_cold_node(sibling)
         sibling.leaf = new_leaf
         self._set_pointer(parent=parent, child_index=sibling_index, node_id=sibling.key, leaf_p=new_leaf, location=self.ORAM)

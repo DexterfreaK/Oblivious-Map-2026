@@ -25,7 +25,7 @@ def _build_two_level_hot_bplus(client, cache_size=2, threshold=0):
 
 
 def _build_three_level_hot_bplus(client, cache_size=0, threshold=100):
-    """Build a deeper B+ tree so subtree-height sensitivity can target a mid-level internal node."""
+    """Build a deeper B+ tree so subtree-height secret_user_id assignment can target a mid-level internal node."""
     omap = BPlusOmapHotNodesClient(
         order=4,
         num_data=128,
@@ -166,6 +166,10 @@ class TestBPlusOmapHotNodesClient:
         right_leaf_key = omap.hot_nodes_client[0]
 
         assert omap.search(key=1) == 1
+        assert omap.hot_cache_evictions == 0
+        assert omap.hot_nodes_client == [right_leaf_key]
+
+        assert omap.search(key=1) == 1
         assert omap.hot_cache_evictions > 0
         assert len(omap.hot_nodes_client) == 1
         assert right_leaf_key not in omap.hot_nodes_client
@@ -207,6 +211,16 @@ class TestBPlusOmapHotNodesClient:
         client.reset_rounds()
         assert omap.search(key=21) == 21
         assert client.get_rounds() == 4
+        assert omap.hot_nodes_client == [ids["leaf_2330"], ids["right_internal"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 4
+        assert omap.hot_nodes_client == [ids["leaf_2330"], ids["right_internal"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 4
         assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
 
         client.reset_rounds()
@@ -240,7 +254,13 @@ class TestBPlusOmapHotNodesClient:
         client.reset_rounds()
         assert omap.search(key=30) == 30
         assert client.get_rounds() == 4
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_2330"]]
+        assert omap.hot_nodes_client == [ids["leaf_21"], ids["right_internal"]]
+
+        right_node = omap._hot_nodes_client[ids["right_internal"]]
+        child_index = omap._find_child_index(right_node, 30)
+        pointer_after_revisit = right_node.value.values[child_index]
+        assert pointer_after_revisit["node_id"] == ids["leaf_2330"]
+        assert pointer_after_revisit["location"] == omap.ORAM
 
     def test_fast_search_flushes_hot_cache(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)
@@ -282,10 +302,10 @@ class TestBPlusOmapHotNodesClient:
         for key in (1, 3, 4, 5, 6, 7, 8, 9):
             assert omap.search(key=key) == key
 
-    def test_set_sensitivity_updates_mid_subtree_and_current_path(self, client):
+    def test_set_secret_user_id_updates_mid_subtree_and_current_path(self, client):
         omap = _build_three_level_hot_bplus(client=client, cache_size=0, threshold=100)
 
-        assert omap.set_sensitivity(key=12, subtree_height=2, sensitivity=10) == 12
+        assert omap.set_secret_user_id(key=12, subtree_height=2, secret_user_id=10) == 12
 
         root_node = _resident_node(omap, omap.root[0])
         middle_ptr = root_node.value.values[omap._find_child_index(root_node, 12)]
@@ -293,21 +313,21 @@ class TestBPlusOmapHotNodesClient:
         leaf_ptr = middle_node.value.values[omap._find_child_index(middle_node, 12)]
         leaf_node = _resident_node(omap, leaf_ptr["node_id"])
 
-        assert root_node.value.metadata["sensitivity"] == 0
-        assert root_node.value.metadata["lazy_sensitivity"] is None
+        assert root_node.value.metadata["secret_user_id"] == 0
+        assert root_node.value.metadata["lazy_secret_user_id"] is None
 
-        assert middle_node.value.metadata["sensitivity"] == 10
-        assert middle_node.value.metadata["lazy_sensitivity"] == 10
+        assert middle_node.value.metadata["secret_user_id"] == 10
+        assert middle_node.value.metadata["lazy_secret_user_id"] == 10
         assert middle_node.value.metadata["lazy_height"] == 1
 
         assert leaf_node.value.keys == [11, 12]
-        assert leaf_node.value.metadata["sensitivity"] == 10
-        assert leaf_node.value.metadata["lazy_sensitivity"] is None
+        assert leaf_node.value.metadata["secret_user_id"] == 10
+        assert leaf_node.value.metadata["lazy_secret_user_id"] is None
 
-    def test_later_access_lazily_propagates_sensitivity_to_sibling_leaf(self, client):
+    def test_later_access_lazily_propagates_secret_user_id_to_sibling_leaf(self, client):
         omap = _build_three_level_hot_bplus(client=client, cache_size=0, threshold=100)
 
-        assert omap.set_sensitivity(key=12, subtree_height=2, sensitivity=10) == 12
+        assert omap.set_secret_user_id(key=12, subtree_height=2, secret_user_id=10) == 12
         assert omap.search(key=9) == 9
 
         root_node = _resident_node(omap, omap.root[0])
@@ -316,5 +336,5 @@ class TestBPlusOmapHotNodesClient:
         sibling_leaf = _resident_node(omap, middle_node.value.values[1]["node_id"])
 
         assert sibling_leaf.value.keys == [9, 10]
-        assert sibling_leaf.value.metadata["sensitivity"] == 10
-        assert sibling_leaf.value.metadata["sensitivity_version"] == 1
+        assert sibling_leaf.value.metadata["secret_user_id"] == 10
+        assert sibling_leaf.value.metadata["secret_user_id_version"] == 1
