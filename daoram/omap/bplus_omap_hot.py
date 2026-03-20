@@ -20,6 +20,12 @@ from daoram.dependency import (
     PathData,
 )
 from daoram.omap.bplus_omap import BPlusOmap
+from daoram.omap.hot_cache_admission import (
+    HotCacheAdmissionDecision,
+    HotCacheAdmissionLayer,
+    ScoreBasedHotCacheAdmissionLayer,
+    make_hot_cache_candidate,
+)
 
 
 @dataclass
@@ -63,6 +69,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         max_secret_user_id_value: Any = None,
         default_sensitivity: Any = None,
         max_sensitivity_value: Any = None,
+        hot_admission_layer: HotCacheAdmissionLayer = None,
     ):
         if default_sensitivity is not None:
             default_secret_user_id = default_sensitivity
@@ -96,6 +103,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._hot_nodes_client: "OrderedDict[Any, Data]" = OrderedDict()
         self._stash_size += self._hot_nodes_client_size
         self._secret_user_id_version = 0
+        self._hot_admission_layer = hot_admission_layer or ScoreBasedHotCacheAdmissionLayer()
 
         self.hot_cache_hits = 0
         self.hot_cache_misses = 0
@@ -309,45 +317,21 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 break
         return child_index
 
-    def _numeric_secret_user_id(self, node: Data) -> float:
-        """Convert secret_user_id to a numeric score when possible."""
-        secret_user_id = self._ensure_node_metadata(node)["secret_user_id"]
-        return float(secret_user_id) if isinstance(secret_user_id, (int, float)) else 0.0
+    def _make_hot_cache_candidate(self, node: Data):
+        """Project a mutable node into the separate admission layer."""
+        return make_hot_cache_candidate(key=node.key, metadata=self._ensure_node_metadata(node))
 
-    def _hot_score(self, node: Data) -> Tuple[int, float]:
-        metadata = self._ensure_node_metadata(node)
-        return metadata["access_count"], self._numeric_secret_user_id(node)
-
-    def _select_eviction_candidate(self) -> Any:
-        """Evict lowest-score node, breaking ties by current cache order."""
-        victim_key = None
-        victim_score = None
-        for lru_rank, (key, node) in enumerate(self._hot_nodes_client.items()):
-            score = (*self._hot_score(node), lru_rank)
-            if victim_score is None or score < victim_score:
-                victim_key = key
-                victim_score = score
-        return victim_key
-
-    def _should_admit_hot_candidate(self, node: Data) -> bool:
-        """Admit a cold candidate only if it beats the weakest cached node."""
-        if self._hot_nodes_client_size == 0:
-            return False
-
+    def _decide_hot_cache_admission(self, node: Data) -> HotCacheAdmissionDecision:
+        """Ask the admission layer whether a cold node should enter the hot cache."""
         if node.key in self._hot_nodes_client:
-            return True
+            return HotCacheAdmissionDecision(admit=True)
 
-        if len(self._hot_nodes_client) < self._hot_nodes_client_size:
-            return True
-
-        victim_key = self._select_eviction_candidate()
-        if victim_key is None:
-            return False
-
-        victim_node = self._hot_nodes_client[victim_key]
-        candidate_score = self._hot_score(node)
-        victim_score = self._hot_score(victim_node)
-        return candidate_score > victim_score
+        residents = [self._make_hot_cache_candidate(cached) for cached in self._hot_nodes_client.values()]
+        return self._hot_admission_layer.decide(
+            candidate=self._make_hot_cache_candidate(node),
+            residents=residents,
+            capacity=self._hot_nodes_client_size,
+        )
 
     def _check_stash_capacity(self) -> None:
         if len(self._stash) > self._stash_size:
@@ -578,6 +562,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self,
         node: Data,
         evicted_active_keys: Set[Any],
+        victim_key: Any = None,
     ) -> bool:
         """Insert a node into the hot cache immediately, evicting a victim if needed."""
         if self._hot_nodes_client_size == 0:
@@ -588,12 +573,13 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             self._hot_nodes_client.move_to_end(node.key)
             return True
 
-        while len(self._hot_nodes_client) >= self._hot_nodes_client_size:
-            victim_key = self._select_eviction_candidate()
+        if len(self._hot_nodes_client) >= self._hot_nodes_client_size:
             if victim_key is None:
                 return False
 
-            victim_cached = self._hot_nodes_client.pop(victim_key)
+            victim_cached = self._hot_nodes_client.pop(victim_key, None)
+            if victim_cached is None:
+                return False
             victim_live = self._local.get(victim_key)
             victim_node = copy.deepcopy(victim_live if victim_live is not None else victim_cached)
             self._evict_hot_node_to_stash(victim_node)
@@ -628,10 +614,12 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         if from_oram:
             self._prepare_cold_node(node)
 
-        if (
-            metadata["access_count"] > self._hot_access_threshold
-            and self._should_admit_hot_candidate(node=node)
-        ):
+        if metadata["access_count"] > self._hot_access_threshold:
+            decision = self._decide_hot_cache_admission(node=node)
+        else:
+            decision = HotCacheAdmissionDecision(admit=False)
+
+        if decision.admit:
             leaf_p = self._get_new_leaf()
             metadata["pinned_leaf"] = leaf_p
             node.leaf = leaf_p
@@ -645,6 +633,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             if self._promote_node_to_hot_cache(
                 node=node,
                 evicted_active_keys=evicted_active_keys if evicted_active_keys is not None else set(),
+                victim_key=decision.evict_key,
             ):
                 self._hot_nodes_client[node.key] = copy.deepcopy(node)
                 self._hot_nodes_client.move_to_end(node.key)

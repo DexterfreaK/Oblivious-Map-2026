@@ -1,7 +1,13 @@
-from daoram.omap import BPlusOmapHotNodesClient
+import random
+
+from daoram.omap import (
+    BPlusOmapHotNodesClient,
+    ExponentialMechanismHotCacheAdmissionLayer,
+    ScoreBasedHotCacheAdmissionLayer,
+)
 
 
-def _build_two_level_hot_bplus(client, cache_size=2, threshold=0):
+def _build_two_level_hot_bplus(client, cache_size=2, threshold=0, hot_admission_layer=None):
     """
     Build a small two-level B+ tree.
 
@@ -17,6 +23,7 @@ def _build_two_level_hot_bplus(client, cache_size=2, threshold=0):
         client=client,
         hot_nodes_client_size=cache_size,
         hot_access_threshold=threshold,
+        hot_admission_layer=hot_admission_layer or ScoreBasedHotCacheAdmissionLayer(),
     )
     omap.init_server_storage()
     for key in (1, 2, 3, 4):
@@ -24,7 +31,7 @@ def _build_two_level_hot_bplus(client, cache_size=2, threshold=0):
     return omap
 
 
-def _build_three_level_hot_bplus(client, cache_size=0, threshold=100):
+def _build_three_level_hot_bplus(client, cache_size=0, threshold=100, hot_admission_layer=None):
     """Build a deeper B+ tree so subtree-height secret_user_id assignment can target a mid-level internal node."""
     omap = BPlusOmapHotNodesClient(
         order=4,
@@ -34,6 +41,7 @@ def _build_three_level_hot_bplus(client, cache_size=0, threshold=100):
         client=client,
         hot_nodes_client_size=cache_size,
         hot_access_threshold=threshold,
+        hot_admission_layer=hot_admission_layer or ScoreBasedHotCacheAdmissionLayer(),
     )
     omap.init_server_storage()
     for key in range(1, 17):
@@ -41,7 +49,7 @@ def _build_three_level_hot_bplus(client, cache_size=0, threshold=100):
     return omap
 
 
-def _build_pictured_hot_bplus(client, cache_size=2, threshold=0):
+def _build_pictured_hot_bplus(client, cache_size=2, threshold=0, hot_admission_layer=None):
     """
     Build the exact tree shape from the user-supplied diagram.
 
@@ -58,6 +66,7 @@ def _build_pictured_hot_bplus(client, cache_size=2, threshold=0):
         client=client,
         hot_nodes_client_size=cache_size,
         hot_access_threshold=threshold,
+        hot_admission_layer=hot_admission_layer or ScoreBasedHotCacheAdmissionLayer(),
     )
     tree = omap._init_ods_storage(data=None)
 
@@ -141,6 +150,46 @@ def _resident_node(omap, node_id):
 
 
 class TestBPlusOmapHotNodesClient:
+    def test_exponential_admission_layer_can_reject_arriving_candidate(self, client):
+        layer = ExponentialMechanismHotCacheAdmissionLayer(
+            epsilon=1.0,
+            distance_fn=lambda candidate, resident: 0.0,
+            rng=random.Random(1),
+        )
+        omap = _build_two_level_hot_bplus(
+            client=client,
+            cache_size=1,
+            threshold=0,
+            hot_admission_layer=layer,
+        )
+
+        assert omap.search(key=4) == 4
+        hot_before = list(omap.hot_nodes_client)
+
+        assert omap.search(key=1) == 1
+        assert omap.hot_nodes_client == hot_before
+        assert omap.hot_cache_evictions == 0
+
+    def test_exponential_admission_layer_can_evict_cached_resident(self, client):
+        layer = ExponentialMechanismHotCacheAdmissionLayer(
+            epsilon=1.0,
+            distance_fn=lambda candidate, resident: 0.0,
+            rng=random.Random(0),
+        )
+        omap = _build_two_level_hot_bplus(
+            client=client,
+            cache_size=1,
+            threshold=0,
+            hot_admission_layer=layer,
+        )
+
+        assert omap.search(key=4) == 4
+        hot_before = list(omap.hot_nodes_client)
+
+        assert omap.search(key=1) == 1
+        assert omap.hot_nodes_client != hot_before
+        assert omap.hot_cache_evictions == 1
+
     def test_repeated_search_promotes_leaf_and_reduces_rounds(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)
 
@@ -284,6 +333,7 @@ class TestBPlusOmapHotNodesClient:
             client=client,
             hot_nodes_client_size=2,
             hot_access_threshold=0,
+            hot_admission_layer=ScoreBasedHotCacheAdmissionLayer(),
         )
         omap.init_server_storage()
 
