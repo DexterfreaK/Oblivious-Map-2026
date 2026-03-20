@@ -87,7 +87,6 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._hot_nodes_client_size = max(0, hot_nodes_client_size)
         self._hot_access_threshold = max(0, hot_access_threshold)
         self._hot_nodes_client: "OrderedDict[Any, Data]" = OrderedDict()
-        self._temp_hot_cache: "OrderedDict[Any, Data]" = OrderedDict()
         self._stash_size += self._hot_nodes_client_size
         self._sensitivity_version = 0
 
@@ -538,27 +537,56 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         """Clear any pinned leaf before normal remapping resumes."""
         self._ensure_node_metadata(node)["pinned_leaf"] = None
 
-    def _record_access_and_stage(
+    def _promote_node_to_hot_cache(
+        self,
+        node: Data,
+        evicted_active_keys: Set[Any],
+    ) -> bool:
+        """Insert a node into the hot cache immediately, evicting a victim if needed."""
+        if self._hot_nodes_client_size == 0:
+            return False
+
+        if node.key in self._hot_nodes_client:
+            self._hot_nodes_client[node.key] = copy.deepcopy(node)
+            self._hot_nodes_client.move_to_end(node.key)
+            return True
+
+        while len(self._hot_nodes_client) >= self._hot_nodes_client_size:
+            victim_key = self._select_eviction_candidate()
+            if victim_key is None:
+                return False
+
+            victim_cached = self._hot_nodes_client.pop(victim_key)
+            victim_live = self._local.get(victim_key)
+            victim_node = copy.deepcopy(victim_live if victim_live is not None else victim_cached)
+            self._evict_hot_node_to_stash(victim_node)
+            if victim_live is not None:
+                evicted_active_keys.add(victim_key)
+            self.hot_cache_evictions += 1
+
+        self._hot_nodes_client[node.key] = copy.deepcopy(node)
+        self.hot_cache_promotions += 1
+        return True
+
+    def _record_access_and_place_node(
         self,
         node: Data,
         parent: Data = None,
         child_index: int = None,
         from_oram: bool = False,
-    ) -> None:
-        """Increment access metadata and stage newly hot nodes."""
+        evicted_active_keys: Set[Any] = None,
+    ) -> bool:
+        """Increment access metadata and immediately decide whether the node stays hot."""
         metadata = self._ensure_node_metadata(node)
         metadata["access_count"] = min(metadata["access_count"] + 1, self._ACCESS_COUNT_CAP)
 
         if node.key in self._hot_nodes_client:
+            self._hot_nodes_client[node.key] = copy.deepcopy(node)
             self._hot_nodes_client.move_to_end(node.key)
-            return
+            return True
 
         if parent is None or child_index is None:
-            return
-
-        if node.key in self._temp_hot_cache:
-            self._temp_hot_cache[node.key] = copy.deepcopy(node)
-            return
+            return False
 
         if from_oram:
             self._prepare_cold_node(node)
@@ -574,11 +602,17 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 leaf_p=leaf_p,
                 location=self.HOT_CLI_CACHE,
             )
-            self._temp_hot_cache[node.key] = copy.deepcopy(node)
-            return
+            if self._promote_node_to_hot_cache(
+                node=node,
+                evicted_active_keys=evicted_active_keys if evicted_active_keys is not None else set(),
+            ):
+                self._hot_nodes_client[node.key] = copy.deepcopy(node)
+                self._hot_nodes_client.move_to_end(node.key)
+                return True
 
         if from_oram:
             new_leaf = self._get_new_leaf()
+            metadata["pinned_leaf"] = None
             node.leaf = new_leaf
             self._set_pointer(
                 parent=parent,
@@ -587,6 +621,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 leaf_p=new_leaf,
                 location=self.ORAM,
             )
+        return False
 
     def _evict_hot_node_to_stash(self, node: Data) -> None:
         """Place an evicted hot node into the ORAM stash at its committed leaf."""
@@ -598,39 +633,27 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._stash.append(copy.deepcopy(node))
         self._check_stash_capacity()
 
-    def _commit_hot_cache(self, local_by_key: Dict[Any, Data]) -> Set[Any]:
-        """Commit staged candidates and return keys already pushed to stash."""
-        evicted_keys: Set[Any] = set()
+    def _finalize_search_node(self, node_key: Any, evicted_active_keys: Set[Any]) -> None:
+        """Remove a traversal node from local and place it in hot cache or stash."""
+        node = self._local.remove(node_key)
+        if node is None:
+            return
 
-        for key, node in local_by_key.items():
-            if key in self._hot_nodes_client:
-                self._hot_nodes_client[key] = copy.deepcopy(node)
-                self._hot_nodes_client.move_to_end(key)
+        if node.key in self._hot_nodes_client:
+            self._hot_nodes_client[node.key] = copy.deepcopy(node)
+            self._hot_nodes_client.move_to_end(node.key)
+            return
 
-        for key in list(self._temp_hot_cache.keys()):
-            node = local_by_key.get(key, self._temp_hot_cache[key])
+        if node.key not in evicted_active_keys:
+            self._stash.append(node)
+            self._check_stash_capacity()
 
-            if key in self._hot_nodes_client:
-                self._hot_nodes_client[key] = copy.deepcopy(node)
-                self._hot_nodes_client.move_to_end(key)
-                continue
-
-            if self._hot_nodes_client_size == 0:
-                break
-
-            while len(self._hot_nodes_client) >= self._hot_nodes_client_size:
-                victim_key = self._select_eviction_candidate()
-                victim_cached = self._hot_nodes_client.pop(victim_key)
-                victim_node = copy.deepcopy(local_by_key.get(victim_key, victim_cached))
-                self._evict_hot_node_to_stash(victim_node)
-                evicted_keys.add(victim_key)
-                self.hot_cache_evictions += 1
-
-            self._hot_nodes_client[key] = copy.deepcopy(node)
-            self.hot_cache_promotions += 1
-
-        self._temp_hot_cache.clear()
-        return evicted_keys
+    def _writeback_path(self, leaf: Optional[int]) -> None:
+        """Evict the stash onto a path that was just accessed from ORAM."""
+        if leaf is None:
+            return
+        self._client.add_write_path(label=self._name, data=self._evict_stash(leaves=[leaf]))
+        self._client.execute()
 
     def _move_pointer_target_to_local(
         self,
@@ -685,14 +708,12 @@ class BPlusOmapHotNodesClient(BPlusOmap):
     def _flush_hot_nodes_client_to_oram(self) -> None:
         """Move all cached hot nodes into the stash on their committed leaves."""
         if not self._hot_nodes_client:
-            self._temp_hot_cache.clear()
             return
 
         for node in self._hot_nodes_client.values():
             self._evict_hot_node_to_stash(copy.deepcopy(node))
 
         self._hot_nodes_client.clear()
-        self._temp_hot_cache.clear()
 
     def flush_hot_nodes_client_to_oram(self) -> None:
         """Public helper for tests and benchmarks."""
@@ -886,6 +907,138 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._check_stash_capacity()
         self._perform_dummy_operation(num_round=2 * self._max_height - num_retrieved_nodes)
 
+    def _search_with_buffered_path(
+        self,
+        key: Any,
+        value: Any = None,
+        subtree_height: int = None,
+        sensitivity: Any = None,
+    ) -> Any:
+        """Search while keeping the full root-to-leaf path local."""
+        evicted_active_keys: Set[Any] = set()
+
+        super()._move_node_to_local(key=self.root[0], leaf=self.root[1], parent_key=None, child_index=None)
+        node = self._local.get_root()
+        node.leaf = self._get_new_leaf()
+        self.root = (node.key, node.leaf)
+        self._record_access_and_place_node(
+            node=node,
+            parent=None,
+            child_index=None,
+            from_oram=True,
+            evicted_active_keys=evicted_active_keys,
+        )
+
+        while not self._is_leaf_node(node):
+            child_index = self._find_child_index(node=node, key=key)
+            child, from_oram = self._move_pointer_target_to_local(
+                pointer=node.value.values[child_index],
+                parent_key=node.key,
+                child_index=child_index,
+                without_eviction=False,
+                use_hot_cache=True,
+            )
+
+            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._record_access_and_place_node(
+                node=child,
+                parent=node,
+                child_index=child_index,
+                from_oram=from_oram,
+                evicted_active_keys=evicted_active_keys,
+            )
+            node = child
+
+        search_value = None
+        for index, each_key in enumerate(node.value.keys):
+            if key == each_key:
+                search_value = node.value.values[index]
+                if value is not None:
+                    node.value.values[index] = value
+                break
+
+        self._assign_sensitivity_to_current_subtree(
+            subtree_height=subtree_height,
+            sensitivity=sensitivity,
+        )
+
+        for local_node in self._local.to_list():
+            if local_node.key in self._hot_nodes_client:
+                self._hot_nodes_client[local_node.key] = copy.deepcopy(local_node)
+                self._hot_nodes_client.move_to_end(local_node.key)
+            elif local_node.key not in evicted_active_keys:
+                self._stash.append(local_node)
+
+        self._local.clear()
+        self._check_stash_capacity()
+        return search_value
+
+    def _search_with_immediate_writeback(
+        self,
+        key: Any,
+        value: Any = None,
+    ) -> Any:
+        """Search while writing back cold path nodes as soon as their child choice is known."""
+        evicted_active_keys: Set[Any] = set()
+
+        super()._move_node_to_local_without_eviction(
+            key=self.root[0],
+            leaf=self.root[1],
+            parent_key=None,
+            child_index=None,
+        )
+
+        node = self._local.get_root()
+        pending_write_leaf = node.leaf
+        node.leaf = self._get_new_leaf()
+        self.root = (node.key, node.leaf)
+        self._record_access_and_place_node(
+            node=node,
+            parent=None,
+            child_index=None,
+            from_oram=True,
+            evicted_active_keys=evicted_active_keys,
+        )
+
+        while not self._is_leaf_node(node):
+            self._writeback_path(leaf=pending_write_leaf)
+
+            child_index = self._find_child_index(node=node, key=key)
+            pointer = self._normalize_pointer(node.value.values[child_index])
+            child, from_oram = self._move_pointer_target_to_local(
+                pointer=pointer,
+                parent_key=node.key,
+                child_index=child_index,
+                without_eviction=True,
+                use_hot_cache=True,
+            )
+
+            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
+            self._record_access_and_place_node(
+                node=child,
+                parent=node,
+                child_index=child_index,
+                from_oram=from_oram,
+                evicted_active_keys=evicted_active_keys,
+            )
+
+            self._finalize_search_node(node_key=node.key, evicted_active_keys=evicted_active_keys)
+            pending_write_leaf = pointer["leaf_p"] if from_oram else None
+            node = child
+
+        search_value = None
+        for index, each_key in enumerate(node.value.keys):
+            if key == each_key:
+                search_value = node.value.values[index]
+                if value is not None:
+                    node.value.values[index] = value
+                break
+
+        self._finalize_search_node(node_key=node.key, evicted_active_keys=evicted_active_keys)
+        self._writeback_path(leaf=pending_write_leaf)
+        self._check_stash_capacity()
+        return search_value
+
     def search(
         self,
         key: Any,
@@ -900,62 +1053,15 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         if self._local:
             raise MemoryError("The local storage was not emptied before this operation.")
 
-        self._temp_hot_cache.clear()
-
-        try:
-            super()._move_node_to_local(key=self.root[0], leaf=self.root[1], parent_key=None, child_index=None)
-            node = self._local.get_root()
-            node.leaf = self._get_new_leaf()
-            self.root = (node.key, node.leaf)
-            self._record_access_and_stage(node=node, parent=None, child_index=None)
-
-            while not self._is_leaf_node(node):
-                child_index = self._find_child_index(node=node, key=key)
-                child, from_oram = self._move_pointer_target_to_local(
-                    pointer=node.value.values[child_index],
-                    parent_key=node.key,
-                    child_index=child_index,
-                    without_eviction=False,
-                    use_hot_cache=True,
-                )
-
-                self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
-                self._record_access_and_stage(
-                    node=child,
-                    parent=node,
-                    child_index=child_index,
-                    from_oram=from_oram,
-                )
-                node = child
-
-            search_value = None
-            for index, each_key in enumerate(node.value.keys):
-                if key == each_key:
-                    search_value = node.value.values[index]
-                    if value is not None:
-                        node.value.values[index] = value
-                    break
-
-            self._assign_sensitivity_to_current_subtree(
+        if subtree_height is not None or sensitivity is not None:
+            return self._search_with_buffered_path(
+                key=key,
+                value=value,
                 subtree_height=subtree_height,
                 sensitivity=sensitivity,
             )
 
-            local_by_key = {local_node.key: local_node for local_node in self._local.to_list()}
-            evicted_keys = self._commit_hot_cache(local_by_key=local_by_key)
-
-            for node_key, local_node in local_by_key.items():
-                if node_key in self._hot_nodes_client:
-                    self._hot_nodes_client[node_key] = copy.deepcopy(local_node)
-                    self._hot_nodes_client.move_to_end(node_key)
-                elif node_key not in evicted_keys:
-                    self._stash.append(local_node)
-
-            self._local.clear()
-            self._check_stash_capacity()
-            return search_value
-        finally:
-            self._temp_hot_cache.clear()
+        return self._search_with_immediate_writeback(key=key, value=value)
 
     def fast_search(self, key: Any, value: Any = None) -> Any:
         """Fast search on the hot-pointer format, after flushing client hot nodes."""

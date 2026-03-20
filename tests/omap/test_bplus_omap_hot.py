@@ -122,10 +122,22 @@ def _build_pictured_hot_bplus(client, cache_size=2, threshold=0):
     }
 
 
-def _stash_node(omap, node_id):
+def _resident_node(omap, node_id):
+    cached = omap._hot_nodes_client.get(node_id)
+    if cached is not None:
+        return cached
+
     index = omap._find_in_stash(node_id)
-    assert index >= 0
-    return omap._stash[index]
+    if index >= 0:
+        return omap._stash[index]
+
+    tree = omap.client._storage[omap._name]
+    for bucket in tree.storage._internal_data:
+        for node in bucket:
+            if node.key == node_id:
+                return node
+
+    raise AssertionError(f"Node {node_id} is not resident in cache, stash, or server storage.")
 
 
 class TestBPlusOmapHotNodesClient:
@@ -158,9 +170,7 @@ class TestBPlusOmapHotNodesClient:
         assert len(omap.hot_nodes_client) == 1
         assert right_leaf_key not in omap.hot_nodes_client
 
-        root_index = omap._find_in_stash(omap.root[0])
-        assert root_index >= 0
-        root_node = omap._stash[root_index]
+        root_node = _resident_node(omap, omap.root[0])
         child_index = omap._find_child_index(root_node, 4)
         pointer = root_node.value.values[child_index]
 
@@ -198,6 +208,27 @@ class TestBPlusOmapHotNodesClient:
         assert omap.search(key=21) == 21
         assert client.get_rounds() == 4
         assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 2
+        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 2
+        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 2
+        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 2
+        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
+        
 
         right_node = omap._hot_nodes_client[ids["right_internal"]]
         child_index = omap._find_child_index(right_node, 30)
@@ -256,11 +287,11 @@ class TestBPlusOmapHotNodesClient:
 
         assert omap.set_sensitivity(key=12, subtree_height=2, sensitivity=10) == 12
 
-        root_node = _stash_node(omap, omap.root[0])
+        root_node = _resident_node(omap, omap.root[0])
         middle_ptr = root_node.value.values[omap._find_child_index(root_node, 12)]
-        middle_node = _stash_node(omap, middle_ptr["node_id"])
+        middle_node = _resident_node(omap, middle_ptr["node_id"])
         leaf_ptr = middle_node.value.values[omap._find_child_index(middle_node, 12)]
-        leaf_node = _stash_node(omap, leaf_ptr["node_id"])
+        leaf_node = _resident_node(omap, leaf_ptr["node_id"])
 
         assert root_node.value.metadata["sensitivity"] == 0
         assert root_node.value.metadata["lazy_sensitivity"] is None
@@ -279,10 +310,10 @@ class TestBPlusOmapHotNodesClient:
         assert omap.set_sensitivity(key=12, subtree_height=2, sensitivity=10) == 12
         assert omap.search(key=9) == 9
 
-        root_node = _stash_node(omap, omap.root[0])
+        root_node = _resident_node(omap, omap.root[0])
         middle_ptr = root_node.value.values[omap._find_child_index(root_node, 12)]
-        middle_node = _stash_node(omap, middle_ptr["node_id"])
-        sibling_leaf = _stash_node(omap, middle_node.value.values[1]["node_id"])
+        middle_node = _resident_node(omap, middle_ptr["node_id"])
+        sibling_leaf = _resident_node(omap, middle_node.value.values[1]["node_id"])
 
         assert sibling_leaf.value.keys == [9, 10]
         assert sibling_leaf.value.metadata["sensitivity"] == 10
