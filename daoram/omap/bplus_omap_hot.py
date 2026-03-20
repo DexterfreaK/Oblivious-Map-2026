@@ -89,6 +89,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._hot_nodes_client: "OrderedDict[Any, Data]" = OrderedDict()
         self._temp_hot_cache: "OrderedDict[Any, Data]" = OrderedDict()
         self._stash_size += self._hot_nodes_client_size
+        self._sensitivity_version = 0
 
         self.hot_cache_hits = 0
         self.hot_cache_misses = 0
@@ -122,14 +123,24 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         access_count: int = 0,
         sensitivity: Any = None,
         pinned_leaf: Optional[int] = None,
+        sensitivity_version: int = 0,
+        lazy_sensitivity: Any = None,
+        lazy_height: int = 0,
+        lazy_version: int = -1,
     ) -> Dict[str, Any]:
         """Create a metadata block for a node."""
         sensitivity_value = self._default_sensitivity if sensitivity is None else sensitivity
         self._validate_sensitivity_size(sensitivity_value)
+        if lazy_sensitivity is not None:
+            self._validate_sensitivity_size(lazy_sensitivity)
         return {
             "access_count": min(int(access_count), self._ACCESS_COUNT_CAP),
             "sensitivity": copy.deepcopy(sensitivity_value),
             "pinned_leaf": pinned_leaf,
+            "sensitivity_version": int(sensitivity_version),
+            "lazy_sensitivity": copy.deepcopy(lazy_sensitivity),
+            "lazy_height": max(0, int(lazy_height)),
+            "lazy_version": int(lazy_version),
         }
 
     def _ensure_node_metadata(self, node: Data) -> Dict[str, Any]:
@@ -145,10 +156,101 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             metadata["sensitivity"] = copy.deepcopy(self._default_sensitivity)
         if "pinned_leaf" not in metadata:
             metadata["pinned_leaf"] = None
+        if "sensitivity_version" not in metadata:
+            metadata["sensitivity_version"] = 0
+        if "lazy_sensitivity" not in metadata:
+            metadata["lazy_sensitivity"] = None
+        if "lazy_height" not in metadata:
+            metadata["lazy_height"] = 0
+        if "lazy_version" not in metadata:
+            metadata["lazy_version"] = -1
 
         self._validate_sensitivity_size(metadata["sensitivity"])
+        if metadata["lazy_sensitivity"] is not None:
+            self._validate_sensitivity_size(metadata["lazy_sensitivity"])
         metadata["access_count"] = min(int(metadata["access_count"]), self._ACCESS_COUNT_CAP)
+        metadata["sensitivity_version"] = int(metadata["sensitivity_version"])
+        metadata["lazy_height"] = max(0, int(metadata["lazy_height"]))
+        metadata["lazy_version"] = int(metadata["lazy_version"])
         return metadata
+
+    def _next_sensitivity_version(self) -> int:
+        """Return a monotonically increasing version for sensitivity assignments."""
+        self._sensitivity_version += 1
+        return self._sensitivity_version
+
+    def _apply_sensitivity_value(self, node: Data, sensitivity: Any, version: int) -> None:
+        """Apply a sensitivity value if it is newer than the node's current one."""
+        metadata = self._ensure_node_metadata(node)
+        if version < metadata["sensitivity_version"]:
+            return
+
+        self._validate_sensitivity_size(sensitivity)
+        metadata["sensitivity"] = copy.deepcopy(sensitivity)
+        metadata["sensitivity_version"] = int(version)
+
+    def _install_lazy_sensitivity(self, node: Data, sensitivity: Any, height: int, version: int) -> None:
+        """Install or extend a pending lazy sensitivity propagation marker."""
+        if height <= 0:
+            return
+
+        metadata = self._ensure_node_metadata(node)
+        if version < metadata["lazy_version"]:
+            return
+        if version == metadata["lazy_version"] and height <= metadata["lazy_height"]:
+            return
+
+        self._validate_sensitivity_size(sensitivity)
+        metadata["lazy_sensitivity"] = copy.deepcopy(sensitivity)
+        metadata["lazy_height"] = int(height)
+        metadata["lazy_version"] = int(version)
+
+    def _propagate_lazy_sensitivity_to_child(self, parent: Data, child: Data) -> None:
+        """Propagate pending subtree sensitivity from a parent into a visited child."""
+        parent_metadata = self._ensure_node_metadata(parent)
+        pending_sensitivity = parent_metadata["lazy_sensitivity"]
+        pending_height = parent_metadata["lazy_height"]
+        pending_version = parent_metadata["lazy_version"]
+
+        if pending_sensitivity is None or pending_height <= 0:
+            return
+
+        self._apply_sensitivity_value(node=child, sensitivity=pending_sensitivity, version=pending_version)
+        self._install_lazy_sensitivity(
+            node=child,
+            sensitivity=pending_sensitivity,
+            height=pending_height - 1,
+            version=pending_version,
+        )
+
+    def _assign_sensitivity_to_current_subtree(
+        self,
+        subtree_height: int,
+        sensitivity: Any,
+    ) -> None:
+        """Apply sensitivity to the current search path and lazily mark the remaining subtree."""
+        if subtree_height is None and sensitivity is None:
+            return
+        if subtree_height is None or sensitivity is None:
+            raise ValueError("subtree_height and sensitivity must be provided together.")
+        if subtree_height < 1:
+            raise ValueError("subtree_height must be at least 1.")
+        if subtree_height > len(self._local.path):
+            raise ValueError("subtree_height exceeds the current root-to-leaf path length.")
+
+        version = self._next_sensitivity_version()
+        start_index = len(self._local.path) - subtree_height
+
+        for offset, node_key in enumerate(self._local.path[start_index:]):
+            node = self._local.get(node_key)
+            remaining_height = subtree_height - 1 - offset
+            self._apply_sensitivity_value(node=node, sensitivity=sensitivity, version=version)
+            self._install_lazy_sensitivity(
+                node=node,
+                sensitivity=sensitivity,
+                height=remaining_height,
+                version=version,
+            )
 
     @staticmethod
     def _is_pointer(value: Any) -> bool:
@@ -232,6 +334,10 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             access_count=self._ACCESS_COUNT_CAP,
             sensitivity=self._max_sensitivity_value,
             pinned_leaf=max_leaf,
+            sensitivity_version=self._ACCESS_COUNT_CAP,
+            lazy_sensitivity=self._max_sensitivity_value,
+            lazy_height=self._max_height,
+            lazy_version=self._ACCESS_COUNT_CAP,
         )
 
         internal = Data(
@@ -630,6 +736,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=False,
             )
 
+            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
             node = child
             old_leaf = node.leaf
             self._prepare_cold_node(node)
@@ -661,6 +768,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 use_hot_cache=False,
             )
 
+            self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
             self._prepare_cold_node(child)
             self._set_pointer(parent=node, child_index=child_index, node_id=child.key, leaf_p=new_leaf, location=self.ORAM)
             child.leaf = new_leaf
@@ -668,7 +776,9 @@ class BPlusOmapHotNodesClient(BPlusOmap):
 
     def _split_node(self, node: Data) -> Tuple[int, int]:
         """Split an overflowing node and add the new right sibling to stash."""
-        right_node = self._get_bplus_data(sensitivity=self._ensure_node_metadata(node)["sensitivity"])
+        right_metadata = copy.deepcopy(self._ensure_node_metadata(node))
+        right_metadata["pinned_leaf"] = None
+        right_node = self._get_bplus_data(metadata=right_metadata)
 
         if self._is_leaf_node(node):
             right_node.value.keys = node.value.keys[self._mid:]
@@ -776,7 +886,13 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._check_stash_capacity()
         self._perform_dummy_operation(num_round=2 * self._max_height - num_retrieved_nodes)
 
-    def search(self, key: Any, value: Any = None) -> Any:
+    def search(
+        self,
+        key: Any,
+        value: Any = None,
+        subtree_height: int = None,
+        sensitivity: Any = None,
+    ) -> Any:
         """Search using the client hot-node cache on internal traversals."""
         if key is None or self.root is None:
             return None
@@ -803,6 +919,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                     use_hot_cache=True,
                 )
 
+                self._propagate_lazy_sensitivity_to_child(parent=node, child=child)
                 self._record_access_and_stage(
                     node=child,
                     parent=node,
@@ -818,6 +935,11 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                     if value is not None:
                         node.value.values[index] = value
                     break
+
+            self._assign_sensitivity_to_current_subtree(
+                subtree_height=subtree_height,
+                sensitivity=sensitivity,
+            )
 
             local_by_key = {local_node.key: local_node for local_node in self._local.to_list()}
             evicted_keys = self._commit_hot_cache(local_by_key=local_by_key)
@@ -869,6 +991,10 @@ class BPlusOmapHotNodesClient(BPlusOmap):
 
         return search_value
 
+    def set_sensitivity(self, key: Any, subtree_height: int, sensitivity: Any) -> Any:
+        """Traverse to `key` and assign `sensitivity` to the subtree of the given height."""
+        return self.search(key=key, subtree_height=subtree_height, sensitivity=sensitivity)
+
     def _find_path_for_delete(self, key: Any) -> Tuple[Dict[int, Data], List[int]]:
         """Find the delete path under the hot pointer representation."""
         path_nodes: Dict[int, Data] = {}
@@ -896,6 +1022,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             )
             child_node = self._local.remove(self._local.root_key)
 
+            self._propagate_lazy_sensitivity_to_child(parent=node, child=child_node)
             self._prepare_cold_node(child_node)
             self._set_pointer(parent=node, child_index=child_index, node_id=child_node.key, leaf_p=new_leaf, location=self.ORAM)
             child_node.leaf = new_leaf
@@ -920,6 +1047,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         )
         sibling = self._local.remove(self._local.root_key)
 
+        self._propagate_lazy_sensitivity_to_child(parent=parent, child=sibling)
         self._prepare_cold_node(sibling)
         sibling.leaf = new_leaf
         self._set_pointer(parent=parent, child_index=sibling_index, node_id=sibling.key, leaf_p=new_leaf, location=self.ORAM)
