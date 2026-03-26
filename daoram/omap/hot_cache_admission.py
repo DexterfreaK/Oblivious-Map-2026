@@ -1,4 +1,18 @@
-"""Hot-cache admission layers for OMAP hot-node caches."""
+"""Hot-cache admission layers for OMAP hot-node caches.
+
+Only the admission sampler itself is modeled here. If the supplied utility
+function has global sensitivity at most ``utility_sensitivity`` under the
+caller-defined neighboring relation, then the sampling step in
+``ExponentialMechanismHotCacheAdmissionLayer`` matches the standard
+exponential-mechanism form:
+
+    Pr[out] proportional to exp((epsilon * utility) / (2 * utility_sensitivity))
+
+This module does not claim an end-to-end privacy guarantee for the surrounding
+cache, traversal, or ORAM protocol. Those layers may still leak information
+through access patterns, timing, cache state, or any later non-oblivious
+processing unless they are analyzed separately.
+"""
 
 import copy
 import math
@@ -128,21 +142,46 @@ class ScoreBasedHotCacheAdmissionLayer(HotCacheAdmissionLayer):
         return HotCacheAdmissionDecision(admit=False)
 
 
+class RejectAllHotCacheAdmissionLayer(HotCacheAdmissionLayer):
+    """Admission layer that disables all cache promotions."""
+
+    def decide(
+        self,
+        *,
+        candidate: HotCacheAdmissionCandidate,
+        residents: Sequence[HotCacheAdmissionCandidate],
+        capacity: int,
+    ) -> HotCacheAdmissionDecision:
+        return HotCacheAdmissionDecision(admit=False)
+
+
 class ExponentialMechanismHotCacheAdmissionLayer(HotCacheAdmissionLayer):
-    """Probabilistic cache admission using an exponential-mechanism-style choice."""
+    """
+    Probabilistic cache admission using the normalized exponential mechanism.
+
+    Guarantee boundary:
+    if ``utility_fn`` has global sensitivity at most ``utility_sensitivity``
+    under the caller's neighboring relation, then this sampler is
+    ``epsilon``-DP over the candidate-set output distribution. That statement
+    applies only to this sampling step, not to the wider cache or ORAM system.
+    """
 
     def __init__(
         self,
         epsilon: float = 1.0,
+        utility_sensitivity: float = 1.0,
         utility_fn: Callable[[HotCacheAdmissionCandidate, HotCacheAdmissionCandidate], float] = None,
         distance_fn: Callable[[HotCacheAdmissionCandidate, HotCacheAdmissionCandidate], float] = None,
         rng: random.Random = None,
     ):
         if epsilon < 0:
             raise ValueError("epsilon must be non-negative.")
+        if utility_sensitivity <= 0:
+            raise ValueError("utility_sensitivity must be positive.")
         if utility_fn is not None and distance_fn is not None:
             raise ValueError("Provide at most one of utility_fn or distance_fn.")
         self._epsilon = float(epsilon)
+        self._utility_sensitivity = float(utility_sensitivity)
         if utility_fn is not None:
             self._utility_fn = utility_fn
         elif distance_fn is not None:
@@ -166,7 +205,8 @@ class ExponentialMechanismHotCacheAdmissionLayer(HotCacheAdmissionLayer):
         candidate: HotCacheAdmissionCandidate,
         other: HotCacheAdmissionCandidate,
     ) -> float:
-        return math.exp(self._epsilon * self._utility(candidate, other))
+        scaled_utility = (self._epsilon * self._utility(candidate, other)) / (2.0 * self._utility_sensitivity)
+        return math.exp(scaled_utility)
 
     def decide(
         self,

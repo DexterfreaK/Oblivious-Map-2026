@@ -11,6 +11,7 @@ from .hot_cache_admission import (
     HotCacheAdmissionCandidate,
     HotCacheAdmissionDecision,
     HotCacheAdmissionLayer,
+    RejectAllHotCacheAdmissionLayer,
     ScoreBasedHotCacheAdmissionLayer,
     secret_user_id_access_distance,
     secret_user_id_access_utility,

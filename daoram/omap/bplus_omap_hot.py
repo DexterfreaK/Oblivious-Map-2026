@@ -1077,7 +1077,12 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         sensitivity: Any = None,
     ) -> Any:
         """Search using the client hot-node cache on internal traversals."""
-        if key is None or self.root is None:
+        if key is None:
+            self._perform_dummy_operation(num_round=3 * self._max_height)
+            return None
+
+        if self.root is None:
+            self._perform_dummy_operation(num_round=3 * self._max_height)
             return None
 
         if self._local:

@@ -1,9 +1,15 @@
+import math
 import random
 
+from daoram.dependency import InteractLocalServer
 from daoram.omap import (
+    BPlusOmap,
     BPlusOmapHotNodesClient,
     ExponentialMechanismHotCacheAdmissionLayer,
+    HotCacheAdmissionCandidate,
+    RejectAllHotCacheAdmissionLayer,
     ScoreBasedHotCacheAdmissionLayer,
+    secret_user_id_access_utility,
 )
 
 
@@ -29,6 +35,16 @@ def _build_two_level_hot_bplus(client, cache_size=2, threshold=0, hot_admission_
     for key in (1, 2, 3, 4):
         omap.insert(key=key, value=key)
     return omap
+
+
+def _build_regular_bplus(client, order=4, num_data=64):
+    return BPlusOmap(
+        order=order,
+        num_data=num_data,
+        key_size=10,
+        data_size=10,
+        client=client,
+    )
 
 
 def _build_three_level_hot_bplus(client, cache_size=0, threshold=100, hot_admission_layer=None):
@@ -149,7 +165,228 @@ def _resident_node(omap, node_id):
     raise AssertionError(f"Node {node_id} is not resident in cache, stash, or server storage.")
 
 
+def _set_access_count_everywhere(omap, node_id, access_count):
+    cached = omap._hot_nodes_client.get(node_id)
+    if cached is not None:
+        cached.value.metadata["access_count"] = access_count
+
+    for node in omap._stash:
+        if node.key == node_id:
+            node.value.metadata["access_count"] = access_count
+
+    tree = omap.client._storage[omap._name]
+    for bucket in tree.storage._internal_data:
+        for node in bucket:
+            if node.key == node_id:
+                node.value.metadata["access_count"] = access_count
+
+
+def _expected_insert_probability(candidate_access, right_access, resident_access, epsilon, utility_sensitivity=1.0):
+    candidate = HotCacheAdmissionCandidate(
+        key="candidate",
+        metadata={"access_count": candidate_access, "secret_user_id": 0},
+    )
+    right_internal = HotCacheAdmissionCandidate(
+        key="right_internal",
+        metadata={"access_count": right_access, "secret_user_id": 0},
+    )
+    resident_leaf = HotCacheAdmissionCandidate(
+        key="resident_leaf",
+        metadata={"access_count": resident_access, "secret_user_id": 0},
+    )
+
+    right_weight = math.exp(
+        (epsilon * secret_user_id_access_utility(candidate, right_internal)) / (2.0 * utility_sensitivity)
+    )
+    resident_weight = math.exp(
+        (epsilon * secret_user_id_access_utility(candidate, resident_leaf)) / (2.0 * utility_sensitivity)
+    )
+    return (right_weight + resident_weight) / (1.0 + right_weight + resident_weight)
+
+
+def _simulate_pictured_exponential_insert_probability(
+    *,
+    trials,
+    epsilon,
+    candidate_pre_access,
+    right_internal_pre_access,
+    resident_leaf_access,
+    utility_sensitivity=1.0,
+):
+    inserted = 0
+
+    for trial_seed in range(trials):
+        client = InteractLocalServer()
+        omap, ids = _build_pictured_hot_bplus(
+            client=client,
+            cache_size=2,
+            threshold=0,
+            hot_admission_layer=ScoreBasedHotCacheAdmissionLayer(),
+        )
+
+        # Fill the cache through a real search first, but choose the initial hot leaf randomly.
+        warm_key = random.Random(trial_seed).choice([21, 30])
+        assert omap.search(key=warm_key) == warm_key
+
+        # Normalize the resident leaf so the trial starts from the same cached pair.
+        if ids["leaf_21"] not in omap.hot_nodes_client:
+            assert omap.search(key=21) == 21
+            assert omap.search(key=21) == 21
+
+        assert set(omap.hot_nodes_client) == {ids["right_internal"], ids["leaf_21"]}
+
+        _set_access_count_everywhere(omap, ids["right_internal"], right_internal_pre_access)
+        _set_access_count_everywhere(omap, ids["leaf_21"], resident_leaf_access)
+        _set_access_count_everywhere(omap, ids["leaf_2330"], candidate_pre_access)
+
+        omap._hot_admission_layer = ExponentialMechanismHotCacheAdmissionLayer(
+            epsilon=epsilon,
+            utility_sensitivity=utility_sensitivity,
+            rng=random.Random(trial_seed),
+        )
+
+        assert omap.search(key=30) == 30
+        inserted += int(ids["leaf_2330"] in omap.hot_nodes_client)
+
+    expected_probability = _expected_insert_probability(
+        candidate_access=candidate_pre_access + 1,
+        right_access=right_internal_pre_access + 1,
+        resident_access=resident_leaf_access,
+        epsilon=epsilon,
+        utility_sensitivity=utility_sensitivity,
+    )
+    observed_probability = inserted / float(trials)
+    return observed_probability, expected_probability
+
+
+def _assert_probability_matches(observed_probability, expected_probability, trials):
+    sigma = math.sqrt(expected_probability * (1.0 - expected_probability) / float(trials))
+    tolerance = max(0.03, 5.0 * sigma)
+    assert abs(observed_probability - expected_probability) <= tolerance
+
+
 class TestBPlusOmapHotNodesClient:
+    def test_reject_all_layer_matches_base_bplus_omap_behavior(self):
+        base_client = InteractLocalServer()
+        hot_client = InteractLocalServer()
+        base = _build_regular_bplus(client=base_client)
+        hot = BPlusOmapHotNodesClient(
+            order=4,
+            num_data=64,
+            key_size=10,
+            data_size=10,
+            client=hot_client,
+            hot_nodes_client_size=2,
+            hot_access_threshold=0,
+            hot_admission_layer=RejectAllHotCacheAdmissionLayer(),
+        )
+
+        operations = [
+            ("init_server_storage", {}),
+            ("search", {"key": None}),
+            ("search", {"key": 1}),
+            ("insert", {"key": None, "value": None}),
+            ("insert", {"key": 1, "value": 10}),
+            ("insert", {"key": 4, "value": 40}),
+            ("insert", {"key": 2, "value": 20}),
+            ("insert", {"key": 3, "value": 30}),
+            ("search", {"key": 2}),
+            ("search", {"key": 9}),
+            ("search", {"key": 3, "value": 300}),
+            ("fast_search", {"key": 3}),
+            ("fast_search", {"key": 7}),
+            ("delete", {"key": 4}),
+            ("delete", {"key": 99}),
+            ("search", {"key": 4}),
+            ("search", {"key": 3}),
+            ("delete", {"key": 1}),
+            ("delete", {"key": 2}),
+            ("delete", {"key": 3}),
+            ("search", {"key": 3}),
+        ]
+
+        for method_name, kwargs in operations:
+            base_before = base_client.get_rounds()
+            hot_before = hot_client.get_rounds()
+
+            base_result = getattr(base, method_name)(**kwargs)
+            hot_result = getattr(hot, method_name)(**kwargs)
+
+            assert hot_result == base_result
+            assert hot_client.get_rounds() - hot_before == base_client.get_rounds() - base_before
+            assert hot.hot_nodes_client == []
+
+        for key in (1, 2, 3, 4, 9, 99):
+            base_before = base_client.get_rounds()
+            hot_before = hot_client.get_rounds()
+
+            assert hot.search(key=key) == base.search(key=key)
+            assert hot_client.get_rounds() - hot_before == base_client.get_rounds() - base_before
+            assert hot.hot_nodes_client == []
+
+        assert (hot.root is None) == (base.root is None)
+
+    def test_reject_all_admission_layer_disables_hot_cache_promotions(self, client):
+        omap = _build_two_level_hot_bplus(
+            client=client,
+            cache_size=2,
+            threshold=0,
+            hot_admission_layer=RejectAllHotCacheAdmissionLayer(),
+        )
+
+        client.reset_rounds()
+        assert omap.search(key=4) == 4
+        first_rounds = client.get_rounds()
+
+        client.reset_rounds()
+        assert omap.search(key=4) == 4
+        second_rounds = client.get_rounds()
+
+        assert omap.hot_nodes_client == []
+        assert omap.hot_cache_hits == 0
+        assert omap.hot_cache_promotions == 0
+        assert omap.hot_cache_evictions == 0
+        assert first_rounds == second_rounds == 4
+
+    def test_pictured_tree_exponential_mechanism_candidate_is_very_likely_inserted(self):
+        trials = 800
+        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
+            trials=trials,
+            epsilon=5.0,
+            candidate_pre_access=29,
+            right_internal_pre_access=0,
+            resident_leaf_access=1,
+        )
+
+        assert expected_probability > 0.9
+        _assert_probability_matches(observed_probability, expected_probability, trials)
+
+    def test_pictured_tree_exponential_mechanism_candidate_is_very_unlikely_inserted(self):
+        trials = 800
+        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
+            trials=trials,
+            epsilon=6.0,
+            candidate_pre_access=0,
+            right_internal_pre_access=29,
+            resident_leaf_access=30,
+        )
+
+        assert expected_probability < 0.15
+        _assert_probability_matches(observed_probability, expected_probability, trials)
+
+    def test_pictured_tree_exponential_mechanism_candidate_is_near_fifty_fifty(self):
+        trials = 800
+        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
+            trials=trials,
+            epsilon=3.0,
+            candidate_pre_access=8,
+            right_internal_pre_access=11,
+            resident_leaf_access=40,
+        )
+
+        assert 0.45 < expected_probability < 0.55
+        _assert_probability_matches(observed_probability, expected_probability, trials)
+
     def test_exponential_admission_layer_can_reject_arriving_candidate(self, client):
         layer = ExponentialMechanismHotCacheAdmissionLayer(
             epsilon=1.0,
