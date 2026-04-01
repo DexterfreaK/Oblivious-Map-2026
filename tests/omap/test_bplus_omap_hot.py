@@ -1,4 +1,3 @@
-import math
 import random
 
 from daoram.dependency import InteractLocalServer
@@ -6,10 +5,8 @@ from daoram.omap import (
     BPlusOmap,
     BPlusOmapHotNodesClient,
     ExponentialMechanismHotCacheAdmissionLayer,
-    HotCacheAdmissionCandidate,
     RejectAllHotCacheAdmissionLayer,
     ScoreBasedHotCacheAdmissionLayer,
-    secret_user_id_access_utility,
 )
 
 
@@ -141,6 +138,7 @@ def _build_pictured_hot_bplus(client, cache_size=2, threshold=0, hot_admission_l
     omap.root = (root.key, root.leaf)
     client.init_storage(storage={omap._name: tree})
     return omap, {
+        "root": root.key,
         "right_internal": right.key,
         "leaf_21": leaf_21.key,
         "leaf_2330": leaf_2330.key,
@@ -163,106 +161,6 @@ def _resident_node(omap, node_id):
                 return node
 
     raise AssertionError(f"Node {node_id} is not resident in cache, stash, or server storage.")
-
-
-def _set_access_count_everywhere(omap, node_id, access_count):
-    cached = omap._hot_nodes_client.get(node_id)
-    if cached is not None:
-        cached.value.metadata["access_count"] = access_count
-
-    for node in omap._stash:
-        if node.key == node_id:
-            node.value.metadata["access_count"] = access_count
-
-    tree = omap.client._storage[omap._name]
-    for bucket in tree.storage._internal_data:
-        for node in bucket:
-            if node.key == node_id:
-                node.value.metadata["access_count"] = access_count
-
-
-def _expected_insert_probability(candidate_access, right_access, resident_access, epsilon, utility_sensitivity=1.0):
-    candidate = HotCacheAdmissionCandidate(
-        key="candidate",
-        metadata={"access_count": candidate_access, "secret_user_id": 0},
-    )
-    right_internal = HotCacheAdmissionCandidate(
-        key="right_internal",
-        metadata={"access_count": right_access, "secret_user_id": 0},
-    )
-    resident_leaf = HotCacheAdmissionCandidate(
-        key="resident_leaf",
-        metadata={"access_count": resident_access, "secret_user_id": 0},
-    )
-
-    right_weight = math.exp(
-        (epsilon * secret_user_id_access_utility(candidate, right_internal)) / (2.0 * utility_sensitivity)
-    )
-    resident_weight = math.exp(
-        (epsilon * secret_user_id_access_utility(candidate, resident_leaf)) / (2.0 * utility_sensitivity)
-    )
-    return (right_weight + resident_weight) / (1.0 + right_weight + resident_weight)
-
-
-def _simulate_pictured_exponential_insert_probability(
-    *,
-    trials,
-    epsilon,
-    candidate_pre_access,
-    right_internal_pre_access,
-    resident_leaf_access,
-    utility_sensitivity=1.0,
-):
-    inserted = 0
-
-    for trial_seed in range(trials):
-        client = InteractLocalServer()
-        omap, ids = _build_pictured_hot_bplus(
-            client=client,
-            cache_size=2,
-            threshold=0,
-            hot_admission_layer=ScoreBasedHotCacheAdmissionLayer(),
-        )
-
-        # Fill the cache through a real search first, but choose the initial hot leaf randomly.
-        warm_key = random.Random(trial_seed).choice([21, 30])
-        assert omap.search(key=warm_key) == warm_key
-
-        # Normalize the resident leaf so the trial starts from the same cached pair.
-        if ids["leaf_21"] not in omap.hot_nodes_client:
-            assert omap.search(key=21) == 21
-            assert omap.search(key=21) == 21
-
-        assert set(omap.hot_nodes_client) == {ids["right_internal"], ids["leaf_21"]}
-
-        _set_access_count_everywhere(omap, ids["right_internal"], right_internal_pre_access)
-        _set_access_count_everywhere(omap, ids["leaf_21"], resident_leaf_access)
-        _set_access_count_everywhere(omap, ids["leaf_2330"], candidate_pre_access)
-
-        omap._hot_admission_layer = ExponentialMechanismHotCacheAdmissionLayer(
-            epsilon=epsilon,
-            utility_sensitivity=utility_sensitivity,
-            rng=random.Random(trial_seed),
-        )
-
-        assert omap.search(key=30) == 30
-        inserted += int(ids["leaf_2330"] in omap.hot_nodes_client)
-
-    expected_probability = _expected_insert_probability(
-        candidate_access=candidate_pre_access + 1,
-        right_access=right_internal_pre_access + 1,
-        resident_access=resident_leaf_access,
-        epsilon=epsilon,
-        utility_sensitivity=utility_sensitivity,
-    )
-    observed_probability = inserted / float(trials)
-    return observed_probability, expected_probability
-
-
-def _assert_probability_matches(observed_probability, expected_probability, trials):
-    sigma = math.sqrt(expected_probability * (1.0 - expected_probability) / float(trials))
-    tolerance = max(0.03, 5.0 * sigma)
-    assert abs(observed_probability - expected_probability) <= tolerance
 
 
 class TestBPlusOmapHotNodesClient:
@@ -348,45 +246,6 @@ class TestBPlusOmapHotNodesClient:
         assert omap.hot_cache_evictions == 0
         assert first_rounds == second_rounds == 4
 
-    def test_pictured_tree_exponential_mechanism_candidate_is_very_likely_inserted(self):
-        trials = 800
-        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
-            trials=trials,
-            epsilon=5.0,
-            candidate_pre_access=29,
-            right_internal_pre_access=0,
-            resident_leaf_access=1,
-        )
-
-        assert expected_probability > 0.9
-        _assert_probability_matches(observed_probability, expected_probability, trials)
-
-    def test_pictured_tree_exponential_mechanism_candidate_is_very_unlikely_inserted(self):
-        trials = 800
-        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
-            trials=trials,
-            epsilon=6.0,
-            candidate_pre_access=0,
-            right_internal_pre_access=29,
-            resident_leaf_access=30,
-        )
-
-        assert expected_probability < 0.15
-        _assert_probability_matches(observed_probability, expected_probability, trials)
-
-    def test_pictured_tree_exponential_mechanism_candidate_is_near_fifty_fifty(self):
-        trials = 800
-        observed_probability, expected_probability = _simulate_pictured_exponential_insert_probability(
-            trials=trials,
-            epsilon=3.0,
-            candidate_pre_access=8,
-            right_internal_pre_access=11,
-            resident_leaf_access=40,
-        )
-
-        assert 0.45 < expected_probability < 0.55
-        _assert_probability_matches(observed_probability, expected_probability, trials)
-
     def test_exponential_admission_layer_can_reject_arriving_candidate(self, client):
         layer = ExponentialMechanismHotCacheAdmissionLayer(
             epsilon=1.0,
@@ -427,29 +286,106 @@ class TestBPlusOmapHotNodesClient:
         assert omap.hot_nodes_client != hot_before
         assert omap.hot_cache_evictions == 1
 
-    def test_repeated_search_promotes_leaf_and_reduces_rounds(self, client):
+    def test_repeated_search_caches_only_leaf_and_direct_hit_avoids_rounds(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)
 
         client.reset_rounds()
         assert omap.search(key=4) == 4
-        first_rounds = client.get_rounds()
-
+        assert client.get_rounds() == 4
         assert len(omap.hot_nodes_client) == 1
+
+        leaf_key = omap.hot_nodes_client[0]
+        cached_leaf = omap._hot_nodes_client[leaf_key]
+        assert omap._is_leaf_node(cached_leaf)
+        assert omap.root[0] not in omap.hot_nodes_client
+
+        root_node = _resident_node(omap, omap.root[0])
+        child_index = omap._find_child_index(root_node, 4)
+        pointer = root_node.value.values[child_index]
+        assert pointer["node_id"] == leaf_key
+        assert pointer["location"] == omap.ORAM
+        assert pointer["leaf_p"] == cached_leaf.value.metadata["pinned_leaf"]
 
         hits_before = omap.hot_cache_hits
         client.reset_rounds()
         assert omap.search(key=4) == 4
-        second_rounds = client.get_rounds()
+        assert client.get_rounds() == 0
+        assert omap.hot_cache_hits == hits_before + 1
+        assert omap.hot_nodes_client == [leaf_key]
 
-        assert omap.hot_cache_hits > hits_before
-        assert first_rounds == 4
-        assert second_rounds == 2
+    def test_search_update_works_with_hot_leaf_without_rounds(self, client):
+        omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)
 
-    def test_evicted_leaf_keeps_parent_pointer_hot_until_revisit(self, client):
+        assert omap.search(key=4) == 4
+
+        client.reset_rounds()
+        assert omap.search(key=4, value=400) == 4
+        assert client.get_rounds() == 0
+
+        client.reset_rounds()
+        assert omap.search(key=4) == 400
+        assert client.get_rounds() == 0
+
+    def test_precise_rounds_on_pictured_tree_with_leaf_only_cache(self, client):
+        omap, ids = _build_pictured_hot_bplus(client=client, cache_size=2, threshold=0)
+
+        client.reset_rounds()
+        assert omap.search(key=30) == 30
+        assert client.get_rounds() == 6
+        assert omap.hot_nodes_client == [ids["leaf_2330"]]
+
+        client.reset_rounds()
+        assert omap.search(key=30) == 30
+        assert client.get_rounds() == 0
+        assert omap.hot_nodes_client == [ids["leaf_2330"]]
+
+        client.reset_rounds()
+        assert omap.search(key=23) == 23
+        assert client.get_rounds() == 0
+        assert omap.hot_nodes_client == [ids["leaf_2330"]]
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 6
+        assert set(omap.hot_nodes_client) == {ids["leaf_2330"], ids["leaf_21"]}
+
+        client.reset_rounds()
+        assert omap.search(key=21) == 21
+        assert client.get_rounds() == 0
+        assert set(omap.hot_nodes_client) == {ids["leaf_2330"], ids["leaf_21"]}
+
+        right_node = _resident_node(omap, ids["right_internal"])
+        child_index = omap._find_child_index(right_node, 30)
+        pointer = right_node.value.values[child_index]
+        cached_leaf = omap._hot_nodes_client[ids["leaf_2330"]]
+        assert pointer["node_id"] == ids["leaf_2330"]
+        assert pointer["location"] == omap.ORAM
+        assert pointer["leaf_p"] == cached_leaf.value.metadata["pinned_leaf"]
+
+    def test_stale_range_directory_repairs_and_falls_back_to_traversal(self, client):
+        omap, ids = _build_pictured_hot_bplus(client=client, cache_size=2, threshold=0)
+
+        assert omap.search(key=21) == 21
+        assert omap.hot_nodes_client == [ids["leaf_21"]]
+
+        omap._cached_leaf_ranges[ids["leaf_21"]] = (21, 30)
+
+        hits_before = omap.hot_cache_hits
+        misses_before = omap.hot_cache_misses
+        client.reset_rounds()
+        assert omap.search(key=30) == 30
+        assert client.get_rounds() == 6
+        assert omap.hot_cache_hits == hits_before
+        assert omap.hot_cache_misses == misses_before + 1
+        assert omap._cached_leaf_ranges[ids["leaf_21"]] == (21, 21)
+        assert set(omap.hot_nodes_client) == {ids["leaf_21"], ids["leaf_2330"]}
+
+    def test_evicted_leaf_keeps_parent_pointer_in_oram_until_revisit(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=1, threshold=0)
 
         assert omap.search(key=4) == 4
         right_leaf_key = omap.hot_nodes_client[0]
+        right_leaf_slot = omap._hot_nodes_client[right_leaf_key].value.metadata["pinned_leaf"]
 
         assert omap.search(key=1) == 1
         assert omap.hot_cache_evictions == 0
@@ -463,90 +399,26 @@ class TestBPlusOmapHotNodesClient:
         root_node = _resident_node(omap, omap.root[0])
         child_index = omap._find_child_index(root_node, 4)
         pointer = root_node.value.values[child_index]
-
         assert pointer["node_id"] == right_leaf_key
-        assert pointer["location"] == omap.HOT_CLI_CACHE
+        assert pointer["location"] == omap.ORAM
+        assert pointer["leaf_p"] == right_leaf_slot
 
+        client.reset_rounds()
         assert omap.search(key=4) == 4
+        assert client.get_rounds() == 4
 
-    def test_search_update_works_with_hot_leaf(self, client):
+    def test_flush_hot_nodes_client_to_oram_clears_leaf_cache(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)
 
         assert omap.search(key=4) == 4
-        assert omap.search(key=4, value=400) == 4
-        assert omap.search(key=4) == 400
+        assert omap.hot_nodes_client
 
-    # refer to bplus_cache_test.png
-    def test_precise_rounds_on_pictured_tree_with_cache_size_two(self, client):
-        omap, ids = _build_pictured_hot_bplus(client=client, cache_size=2, threshold=0)
+        omap.flush_hot_nodes_client_to_oram()
+        assert omap.hot_nodes_client == []
 
         client.reset_rounds()
-        assert omap.search(key=30) == 30
-        assert client.get_rounds() == 6
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_2330"]]
-
-        right_node = omap._hot_nodes_client[ids["right_internal"]]
-        child_index = omap._find_child_index(right_node, 30)
-        stale_pointer = dict(right_node.value.values[child_index])
-
-        client.reset_rounds()
-        assert omap.search(key=30) == 30
-        assert client.get_rounds() == 2
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_2330"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
+        assert omap.search(key=4) == 4
         assert client.get_rounds() == 4
-        assert omap.hot_nodes_client == [ids["leaf_2330"], ids["right_internal"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 4
-        assert omap.hot_nodes_client == [ids["leaf_2330"], ids["right_internal"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 4
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 2
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 2
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 2
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
-
-        client.reset_rounds()
-        assert omap.search(key=21) == 21
-        assert client.get_rounds() == 2
-        assert omap.hot_nodes_client == [ids["right_internal"], ids["leaf_21"]]
-        
-
-        right_node = omap._hot_nodes_client[ids["right_internal"]]
-        child_index = omap._find_child_index(right_node, 30)
-        pointer_after_eviction = right_node.value.values[child_index]
-        assert pointer_after_eviction["node_id"] == ids["leaf_2330"]
-        assert pointer_after_eviction["location"] == omap.HOT_CLI_CACHE
-        assert pointer_after_eviction["leaf_p"] == stale_pointer["leaf_p"]
-
-        client.reset_rounds()
-        assert omap.search(key=30) == 30
-        assert client.get_rounds() == 4
-        assert omap.hot_nodes_client == [ids["leaf_21"], ids["right_internal"]]
-
-        right_node = omap._hot_nodes_client[ids["right_internal"]]
-        child_index = omap._find_child_index(right_node, 30)
-        pointer_after_revisit = right_node.value.values[child_index]
-        assert pointer_after_revisit["node_id"] == ids["leaf_2330"]
-        assert pointer_after_revisit["location"] == omap.ORAM
 
     def test_fast_search_flushes_hot_cache(self, client):
         omap = _build_two_level_hot_bplus(client=client, cache_size=2, threshold=0)

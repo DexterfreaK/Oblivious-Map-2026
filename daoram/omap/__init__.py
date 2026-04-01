@@ -6,6 +6,7 @@ from .avl_omap_voram import AVLOmapVoram
 from .bplus_omap import BPlusOmap
 from .bplus_omap_cache import BPlusOmapCached
 from .bplus_omap_hot import BPlusOmapHotNodesClient
+from .bplus_omap_hot_benchmark import BPlusOmapHotNodesBenchmark
 from .hot_cache_admission import (
     ExponentialMechanismHotCacheAdmissionLayer,
     HotCacheAdmissionCandidate,

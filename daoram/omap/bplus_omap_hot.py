@@ -101,6 +101,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         self._hot_nodes_client_size = max(0, hot_nodes_client_size)
         self._hot_access_threshold = max(0, hot_access_threshold)
         self._hot_nodes_client: "OrderedDict[Any, Data]" = OrderedDict()
+        self._cached_leaf_ranges: Dict[Any, Tuple[Any, Any]] = {}
         self._stash_size += self._hot_nodes_client_size
         self._secret_user_id_version = 0
         self._hot_admission_layer = hot_admission_layer or ScoreBasedHotCacheAdmissionLayer()
@@ -320,6 +321,74 @@ class BPlusOmapHotNodesClient(BPlusOmap):
     def _make_hot_cache_candidate(self, node: Data):
         """Project a mutable node into the separate admission layer."""
         return make_hot_cache_candidate(key=node.key, metadata=self._ensure_node_metadata(node))
+
+    def _is_cacheable_leaf(self, node: Data) -> bool:
+        """Return whether a node is a non-empty B+ leaf eligible for client caching."""
+        return self._is_leaf_node(node) and bool(node.value.keys)
+
+    def _leaf_key_range(self, node: Data) -> Optional[Tuple[Any, Any]]:
+        """Return the inclusive search-key range covered by a cached leaf."""
+        if not self._is_cacheable_leaf(node):
+            return None
+        return node.value.keys[0], node.value.keys[-1]
+
+    def _drop_cached_leaf_range(self, node_key: Any) -> None:
+        """Remove a cached-leaf directory entry."""
+        self._cached_leaf_ranges.pop(node_key, None)
+
+    def _update_cached_leaf_range(self, node: Data) -> None:
+        """Refresh the client-side range directory for a cached leaf."""
+        self._drop_cached_leaf_range(node.key)
+        leaf_range = self._leaf_key_range(node)
+        if leaf_range is not None:
+            self._cached_leaf_ranges[node.key] = leaf_range
+
+    def _touch_cached_leaf(self, node: Data, *, move_to_end: bool = True) -> None:
+        """Refresh a cached leaf snapshot and its directory entry."""
+        if not self._is_cacheable_leaf(node):
+            raise ValueError("Only non-empty B+ leaves may reside in the client hot cache.")
+
+        self._hot_nodes_client[node.key] = copy.deepcopy(node)
+        if move_to_end:
+            self._hot_nodes_client.move_to_end(node.key)
+        self._update_cached_leaf_range(node)
+
+    def _lookup_cached_leaf_key(self, key: Any) -> Any:
+        """Return the cached leaf id whose recorded range contains `key`, if any."""
+        for node_key, (first_key, last_key) in self._cached_leaf_ranges.items():
+            if first_key <= key <= last_key:
+                return node_key
+        return None
+
+    def _search_cached_leaf(self, key: Any, value: Any = None) -> Tuple[bool, Any]:
+        """
+        Attempt to satisfy a plain search directly from the client leaf cache.
+
+        Returns `(hit, result)`. A stale directory hit repairs the directory and
+        reports a miss so the caller can fall back to a full traversal.
+        """
+        node_key = self._lookup_cached_leaf_key(key)
+        if node_key is None:
+            return False, None
+
+        cached = self._hot_nodes_client.get(node_key)
+        if cached is None:
+            self._drop_cached_leaf_range(node_key)
+            return False, None
+
+        for index, each_key in enumerate(cached.value.keys):
+            if key == each_key:
+                metadata = self._ensure_node_metadata(cached)
+                metadata["access_count"] = min(metadata["access_count"] + 1, self._ACCESS_COUNT_CAP)
+                search_value = cached.value.values[index]
+                if value is not None:
+                    cached.value.values[index] = value
+                self._touch_cached_leaf(cached)
+                self.hot_cache_hits += 1
+                return True, search_value
+
+        self._update_cached_leaf_range(cached)
+        return False, None
 
     def _decide_hot_cache_admission(self, node: Data) -> HotCacheAdmissionDecision:
         """Ask the admission layer whether a cold node should enter the hot cache."""
@@ -564,13 +633,15 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         evicted_active_keys: Set[Any],
         victim_key: Any = None,
     ) -> bool:
-        """Insert a node into the hot cache immediately, evicting a victim if needed."""
+        """Insert a leaf node into the hot cache immediately, evicting a victim if needed."""
+        if not self._is_cacheable_leaf(node):
+            return False
+
         if self._hot_nodes_client_size == 0:
             return False
 
         if node.key in self._hot_nodes_client:
-            self._hot_nodes_client[node.key] = copy.deepcopy(node)
-            self._hot_nodes_client.move_to_end(node.key)
+            self._touch_cached_leaf(node)
             return True
 
         if len(self._hot_nodes_client) >= self._hot_nodes_client_size:
@@ -580,6 +651,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             victim_cached = self._hot_nodes_client.pop(victim_key, None)
             if victim_cached is None:
                 return False
+            self._drop_cached_leaf_range(victim_key)
             victim_live = self._local.get(victim_key)
             victim_node = copy.deepcopy(victim_live if victim_live is not None else victim_cached)
             self._evict_hot_node_to_stash(victim_node)
@@ -587,7 +659,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 evicted_active_keys.add(victim_key)
             self.hot_cache_evictions += 1
 
-        self._hot_nodes_client[node.key] = copy.deepcopy(node)
+        self._touch_cached_leaf(node)
         self.hot_cache_promotions += 1
         return True
 
@@ -599,47 +671,61 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         from_oram: bool = False,
         evicted_active_keys: Set[Any] = None,
     ) -> bool:
-        """Increment access metadata and immediately decide whether the node stays hot."""
+        """Increment access metadata and decide whether a visited leaf stays hot."""
         metadata = self._ensure_node_metadata(node)
         metadata["access_count"] = min(metadata["access_count"] + 1, self._ACCESS_COUNT_CAP)
 
         if node.key in self._hot_nodes_client:
-            self._hot_nodes_client[node.key] = copy.deepcopy(node)
-            self._hot_nodes_client.move_to_end(node.key)
+            if self._is_cacheable_leaf(node):
+                self._touch_cached_leaf(node)
             return True
-
-        if parent is None or child_index is None:
-            return False
 
         if from_oram:
             self._prepare_cold_node(node)
 
-        if metadata["access_count"] > self._hot_access_threshold:
-            decision = self._decide_hot_cache_admission(node=node)
-        else:
-            decision = HotCacheAdmissionDecision(admit=False)
+        if not self._is_cacheable_leaf(node):
+            if from_oram and parent is not None and child_index is not None:
+                new_leaf = self._get_new_leaf()
+                metadata["pinned_leaf"] = None
+                node.leaf = new_leaf
+                self._set_pointer(
+                    parent=parent,
+                    child_index=child_index,
+                    node_id=node.key,
+                    leaf_p=new_leaf,
+                    location=self.ORAM,
+                )
+            return False
+
+        decision = (
+            self._decide_hot_cache_admission(node=node)
+            if metadata["access_count"] > self._hot_access_threshold
+            else HotCacheAdmissionDecision(admit=False)
+        )
 
         if decision.admit:
-            leaf_p = self._get_new_leaf()
-            metadata["pinned_leaf"] = leaf_p
-            node.leaf = leaf_p
-            self._set_pointer(
-                parent=parent,
-                child_index=child_index,
-                node_id=node.key,
-                leaf_p=leaf_p,
-                location=self.HOT_CLI_CACHE,
-            )
+            committed_leaf = node.leaf if parent is None or child_index is None else self._get_new_leaf()
+            metadata["pinned_leaf"] = committed_leaf
+            node.leaf = committed_leaf
+            if parent is not None and child_index is not None:
+                self._set_pointer(
+                    parent=parent,
+                    child_index=child_index,
+                    node_id=node.key,
+                    leaf_p=committed_leaf,
+                    location=self.ORAM,
+                )
+            else:
+                self.root = (node.key, committed_leaf)
             if self._promote_node_to_hot_cache(
                 node=node,
                 evicted_active_keys=evicted_active_keys if evicted_active_keys is not None else set(),
                 victim_key=decision.evict_key,
             ):
-                self._hot_nodes_client[node.key] = copy.deepcopy(node)
-                self._hot_nodes_client.move_to_end(node.key)
+                self._touch_cached_leaf(node)
                 return True
 
-        if from_oram:
+        if from_oram and parent is not None and child_index is not None:
             new_leaf = self._get_new_leaf()
             metadata["pinned_leaf"] = None
             node.leaf = new_leaf
@@ -669,8 +755,8 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             return
 
         if node.key in self._hot_nodes_client:
-            self._hot_nodes_client[node.key] = copy.deepcopy(node)
-            self._hot_nodes_client.move_to_end(node.key)
+            if self._is_cacheable_leaf(node):
+                self._touch_cached_leaf(node)
             return
 
         if node.key not in evicted_active_keys:
@@ -735,7 +821,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         return self._local.get(child_key), True
 
     def _flush_hot_nodes_client_to_oram(self) -> None:
-        """Move all cached hot nodes into the stash on their committed leaves."""
+        """Move all cached leaves into the stash on their committed fallback leaves."""
         if not self._hot_nodes_client:
             return
 
@@ -743,6 +829,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
             self._evict_hot_node_to_stash(copy.deepcopy(node))
 
         self._hot_nodes_client.clear()
+        self._cached_leaf_ranges.clear()
 
     def flush_hot_nodes_client_to_oram(self) -> None:
         """Public helper for tests and benchmarks."""
@@ -944,6 +1031,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
         secret_user_id: Any = None,
     ) -> Any:
         """Search while keeping the full root-to-leaf path local."""
+        self._flush_hot_nodes_client_to_oram()
         evicted_active_keys: Set[Any] = set()
 
         super()._move_node_to_local(key=self.root[0], leaf=self.root[1], parent_key=None, child_index=None)
@@ -965,7 +1053,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 parent_key=node.key,
                 child_index=child_index,
                 without_eviction=False,
-                use_hot_cache=True,
+                use_hot_cache=False,
             )
 
             self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
@@ -993,8 +1081,8 @@ class BPlusOmapHotNodesClient(BPlusOmap):
 
         for local_node in self._local.to_list():
             if local_node.key in self._hot_nodes_client:
-                self._hot_nodes_client[local_node.key] = copy.deepcopy(local_node)
-                self._hot_nodes_client.move_to_end(local_node.key)
+                if self._is_cacheable_leaf(local_node):
+                    self._touch_cached_leaf(local_node)
             elif local_node.key not in evicted_active_keys:
                 self._stash.append(local_node)
 
@@ -1039,7 +1127,7 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 parent_key=node.key,
                 child_index=child_index,
                 without_eviction=True,
-                use_hot_cache=True,
+                use_hot_cache=False,
             )
 
             self._propagate_lazy_secret_user_id_to_child(parent=node, child=child)
@@ -1101,6 +1189,11 @@ class BPlusOmapHotNodesClient(BPlusOmap):
                 secret_user_id=secret_user_id,
             )
 
+        hit, search_value = self._search_cached_leaf(key=key, value=value)
+        if hit:
+            return search_value
+
+        self.hot_cache_misses += 1
         return self._search_with_immediate_writeback(key=key, value=value)
 
     def fast_search(self, key: Any, value: Any = None) -> Any:
